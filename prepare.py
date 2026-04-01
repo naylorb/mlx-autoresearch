@@ -208,3 +208,189 @@ def train_tokenizer():
     decoded = enc.decode(encoded)
     assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
     print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+
+
+# ---------------------------------------------------------------------------
+# Runtime utilities (imported by train.py)
+# ---------------------------------------------------------------------------
+
+class Tokenizer:
+    """Minimal tokenizer wrapper. Training is handled above."""
+
+    def __init__(self, enc):
+        self.enc = enc
+        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+
+    @classmethod
+    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
+        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
+            enc = pickle.load(f)
+        return cls(enc)
+
+    def get_vocab_size(self):
+        return self.enc.n_vocab
+
+    def get_bos_token_id(self):
+        return self.bos_token_id
+
+    def encode(self, text, prepend=None, num_threads=8):
+        if prepend is not None:
+            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
+        if isinstance(text, str):
+            ids = self.enc.encode_ordinary(text)
+            if prepend is not None:
+                ids.insert(0, prepend_id)
+        elif isinstance(text, list):
+            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
+            if prepend is not None:
+                for row in ids:
+                    row.insert(0, prepend_id)
+        else:
+            raise ValueError(f"Invalid input type: {type(text)}")
+        return ids
+
+    def decode(self, ids):
+        return self.enc.decode(ids)
+
+
+def get_token_bytes():
+    """Load token byte lengths as mx.array (saved as .npy by train_tokenizer)."""
+    path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
+    return mx.array(np.load(path))
+
+
+def _document_batches(split, tokenizer_batch_size=128):
+    """Infinite iterator over document batches from parquet files."""
+    parquet_paths = list_parquet_files()
+    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
+    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+    if split == "train":
+        parquet_paths = [p for p in parquet_paths if p != val_path]
+    else:
+        parquet_paths = [val_path]
+    epoch = 1
+    while True:
+        for filepath in parquet_paths:
+            pf = pq.ParquetFile(filepath)
+            for rg_idx in range(pf.num_row_groups):
+                rg = pf.read_row_group(rg_idx)
+                batch = rg.column('text').to_pylist()
+                for i in range(0, len(batch), tokenizer_batch_size):
+                    yield batch[i:i+tokenizer_batch_size], epoch
+        epoch += 1
+
+
+def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+    """
+    BOS-aligned dataloader with best-fit packing.
+    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
+    Yields (inputs, targets, epoch) as mx.array — no CPU/GPU buffer management needed
+    since MLX uses unified memory.
+    """
+    assert split in ["train", "val"]
+    row_capacity = T + 1
+    batches = _document_batches(split)
+    bos_token = tokenizer.get_bos_token_id()
+    doc_buffer = []
+    epoch = 1
+
+    def refill_buffer():
+        nonlocal epoch
+        doc_batch, epoch = next(batches)
+        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
+        doc_buffer.extend(token_lists)
+
+    # Single row buffer — no dual CPU/GPU buffers needed (unified memory)
+    row_buffer = np.empty((B, row_capacity), dtype=np.int32)
+
+    while True:
+        for row_idx in range(B):
+            pos = 0
+            while pos < row_capacity:
+                while len(doc_buffer) < buffer_size:
+                    refill_buffer()
+
+                remaining = row_capacity - pos
+
+                # Find largest doc that fits entirely
+                best_idx = -1
+                best_len = 0
+                for i, doc in enumerate(doc_buffer):
+                    doc_len = len(doc)
+                    if doc_len <= remaining and doc_len > best_len:
+                        best_idx = i
+                        best_len = doc_len
+
+                if best_idx >= 0:
+                    doc = doc_buffer.pop(best_idx)
+                    row_buffer[row_idx, pos:pos + len(doc)] = doc
+                    pos += len(doc)
+                else:
+                    # No doc fits — crop shortest to fill remaining
+                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+                    doc = doc_buffer.pop(shortest_idx)
+                    row_buffer[row_idx, pos:pos + remaining] = doc[:remaining]
+                    pos += remaining
+
+        # Create mx.array directly — unified memory, immediately available
+        data = mx.array(row_buffer)
+        inputs = data[:, :-1]
+        targets = data[:, 1:]
+        yield inputs, targets, epoch
+
+
+# ---------------------------------------------------------------------------
+# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# ---------------------------------------------------------------------------
+
+def evaluate_bpb(model, tokenizer, batch_size):
+    """
+    Bits per byte (BPB): vocab size-independent evaluation metric.
+    Sums per-token cross-entropy (in nats), sums target byte lengths,
+    then converts nats/byte to bits/byte. Special tokens (byte length 0)
+    are excluded from both sums.
+    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+
+    No @torch.no_grad() needed — MLX doesn't compute gradients unless
+    you explicitly call mx.grad or nn.value_and_grad.
+    """
+    import mlx.nn as nn
+    token_bytes = get_token_bytes()
+    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
+    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    total_nats = 0.0
+    total_bytes = 0
+    for _ in range(steps):
+        x, y, _ = next(val_loader)
+        loss_flat = model(x, y, reduction='none').reshape(-1)
+        y_flat = y.reshape(-1)
+        nbytes = token_bytes[y_flat]
+        mask = nbytes > 0
+        total_nats += (loss_flat * mask).sum().item()
+        total_bytes += nbytes.sum().item()
+    return total_nats / (math.log(2) * total_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch-mlx")
+    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
+    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    args = parser.parse_args()
+
+    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+
+    print(f"Cache directory: {CACHE_DIR}")
+    print()
+
+    # Step 1: Download data
+    download_data(num_shards, download_workers=args.download_workers)
+    print()
+
+    # Step 2: Train tokenizer
+    train_tokenizer()
+    print()
+    print("Done! Ready to train.")
