@@ -354,7 +354,6 @@ def evaluate_bpb(model, tokenizer, batch_size):
     No @torch.no_grad() needed — MLX doesn't compute gradients unless
     you explicitly call mx.grad or nn.value_and_grad.
     """
-    import mlx.nn as nn
     token_bytes = get_token_bytes()
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
     steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
