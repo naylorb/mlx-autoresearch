@@ -345,3 +345,221 @@ class GPT(nn.Module):
             loss = mx.mean(nn.losses.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction='none')) if reduction == 'mean' else nn.losses.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction='none')
             return loss
         return logits
+
+
+# ---------------------------------------------------------------------------
+# Optimizer (MuonAdamW)
+# ---------------------------------------------------------------------------
+
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+
+
+def adamw_step(p, grad, exp_avg, exp_avg_sq, step_count, lr, beta1, beta2, eps, wd):
+    """Single AdamW parameter update."""
+    p = p * (1 - lr * wd)
+    # Lerp: a + t * (b - a)
+    exp_avg = exp_avg + (1 - beta1) * (grad - exp_avg)
+    exp_avg_sq = exp_avg_sq + (1 - beta2) * (grad * grad - exp_avg_sq)
+    bias1 = 1 - beta1 ** step_count
+    bias2 = 1 - beta2 ** step_count
+    denom = mx.sqrt(exp_avg_sq / bias2) + eps
+    step_size = lr / bias1
+    p = p - step_size * exp_avg / denom
+    return p, exp_avg, exp_avg_sq
+
+
+def muon_step(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
+              momentum, lr, wd, beta2, ns_steps, red_dim):
+    """Batched Muon step for a group of same-shaped matrix parameters."""
+    # Nesterov momentum: buf = lerp(buf, grad, 1-momentum), g = lerp(grad, buf, momentum)
+    momentum_buffer = momentum_buffer + (1 - momentum) * (stacked_grads - momentum_buffer)
+    g = stacked_grads + momentum * (momentum_buffer - stacked_grads)
+
+    # Polar Express orthogonalization (5-step Neumann series)
+    X = g.astype(mx.bfloat16)
+    X = X / (mx.linalg.norm(X, axis=(-2, -1), keepdims=True) * 1.02 + 1e-6)
+    if g.shape[-2] > g.shape[-1]:
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = mx.matmul(mx.swapaxes(X, -2, -1), X)
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ mx.swapaxes(X, -2, -1)
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    g = X
+
+    # NorMuon variance reduction
+    v_mean = mx.mean(g.astype(mx.float32) ** 2, axis=red_dim, keepdims=True)
+    red_dim_size = g.shape[red_dim]
+    v_norm_sq = mx.sum(v_mean, axis=(-2, -1), keepdims=True) * red_dim_size
+    v_norm = mx.sqrt(v_norm_sq)
+
+    second_momentum_buffer = second_momentum_buffer + (1 - beta2) * (v_mean.astype(second_momentum_buffer.dtype) - second_momentum_buffer)
+
+    step_size = mx.rsqrt(mx.clip(second_momentum_buffer, a_min=1e-10, a_max=None))
+    scaled_sq_sum = (v_mean * red_dim_size) * (step_size.astype(mx.float32) ** 2)
+    v_norm_new = mx.sqrt(mx.sum(scaled_sq_sum, axis=(-2, -1), keepdims=True))
+    final_scale = step_size * (v_norm / mx.clip(v_norm_new, a_min=1e-10, a_max=None))
+    g = g * final_scale.astype(g.dtype)
+
+    # Cautious weight decay + parameter update
+    mask = (g * stacked_params) >= 0
+    stacked_params = stacked_params - lr * g - lr * wd * stacked_params * mask
+
+    return stacked_params, momentum_buffer, second_momentum_buffer
+
+
+# Compile individual step functions (Critical note #3: NOT the full step method)
+adamw_step_compiled = mx.compile(adamw_step)
+muon_step_compiled = mx.compile(muon_step)
+
+
+class MuonAdamW:
+    """Combined optimizer: Muon for 2D matrix params, AdamW for others.
+
+    Interface: optimizer.update(model, grads) — modifies model in place.
+    Following MLX optimizer conventions.
+    """
+
+    def __init__(self, model, param_groups):
+        """
+        param_groups: dict mapping param_path -> {kind, lr, ...}
+        """
+        self.param_groups = param_groups
+        self.state = {}
+        self.step_count = 0
+
+        # Pre-classify params for efficient iteration
+        self._adamw_paths = []
+        self._muon_groups = {}  # shape -> [paths]
+
+        for path, config in param_groups.items():
+            config['initial_lr'] = config['lr']
+            if config['kind'] == 'adamw':
+                self._adamw_paths.append(path)
+            elif config['kind'] == 'muon':
+                # Group muon params by shape for batched polar decomposition
+                param = self._get_param(model, path)
+                shape_key = param.shape
+                if shape_key not in self._muon_groups:
+                    self._muon_groups[shape_key] = []
+                self._muon_groups[shape_key].append(path)
+
+    def _get_param(self, model, path):
+        """Navigate model tree to get parameter at path."""
+        obj = model
+        for part in path.split("."):
+            if isinstance(obj, dict):
+                obj = obj[part]
+            elif isinstance(obj, (list, tuple)):
+                obj = obj[int(part)]
+            else:
+                obj = getattr(obj, part)
+        return obj
+
+    def _set_param(self, model, path, value):
+        """Navigate model tree to set parameter at path."""
+        parts = path.split(".")
+        obj = model
+        for part in parts[:-1]:
+            if isinstance(obj, dict):
+                obj = obj[part]
+            elif isinstance(obj, (list, tuple)):
+                obj = obj[int(part)]
+            else:
+                obj = getattr(obj, part)
+        last = parts[-1]
+        if isinstance(obj, dict):
+            obj[last] = value
+        elif isinstance(obj, (list, tuple)):
+            obj[int(last)] = value
+        else:
+            setattr(obj, last, value)
+
+    def update(self, model, grads):
+        """Update model parameters given gradients. Modifies model in place."""
+        self.step_count += 1
+
+        # Flatten gradients for path-based lookup
+        flat_grads = {}
+        self._flatten_grads(grads, "", flat_grads)
+
+        # AdamW updates
+        for path in self._adamw_paths:
+            if path not in flat_grads:
+                continue
+            grad = flat_grads[path]
+            param = self._get_param(model, path)
+            cfg = self.param_groups[path]
+
+            if path not in self.state:
+                self.state[path] = {
+                    'exp_avg': mx.zeros_like(param),
+                    'exp_avg_sq': mx.zeros_like(param),
+                }
+            st = self.state[path]
+            new_p, new_avg, new_avg_sq = adamw_step_compiled(
+                param, grad, st['exp_avg'], st['exp_avg_sq'],
+                self.step_count, cfg['lr'], cfg['betas'][0], cfg['betas'][1],
+                cfg['eps'], cfg['weight_decay']
+            )
+            self._set_param(model, path, new_p)
+            st['exp_avg'] = new_avg
+            st['exp_avg_sq'] = new_avg_sq
+
+        # Muon updates (batched per shape group)
+        for shape, paths in self._muon_groups.items():
+            valid_paths = [p for p in paths if p in flat_grads]
+            if not valid_paths:
+                continue
+
+            grads_list = [flat_grads[p] for p in valid_paths]
+            params_list = [self._get_param(model, p) for p in valid_paths]
+            stacked_grads = mx.stack(grads_list)
+            stacked_params = mx.stack(params_list)
+
+            group_key = valid_paths[0]
+            cfg = self.param_groups[group_key]
+
+            if group_key not in self.state:
+                state_shape = (len(valid_paths), shape[-2], 1) if shape[-2] >= shape[-1] else (len(valid_paths), 1, shape[-1])
+                self.state[group_key] = {
+                    'momentum_buffer': mx.zeros((len(valid_paths), *shape), dtype=stacked_params.dtype),
+                    'second_momentum_buffer': mx.zeros(state_shape, dtype=stacked_params.dtype),
+                }
+            st = self.state[group_key]
+
+            red_dim = -1 if shape[-2] >= shape[-1] else -2
+            lr_scaled = cfg['lr'] * max(1.0, shape[-2] / shape[-1])**0.5
+
+            new_params, new_mom, new_sec_mom = muon_step_compiled(
+                stacked_grads, stacked_params,
+                st['momentum_buffer'], st['second_momentum_buffer'],
+                cfg['momentum'], lr_scaled, cfg['weight_decay'],
+                cfg['beta2'], cfg['ns_steps'], red_dim
+            )
+            st['momentum_buffer'] = new_mom
+            st['second_momentum_buffer'] = new_sec_mom
+
+            # Unbind and update individual params
+            for i, p in enumerate(valid_paths):
+                self._set_param(model, p, new_params[i])
+
+    def _flatten_grads(self, grads, prefix, result):
+        """Flatten nested gradient dict to path -> array."""
+        if isinstance(grads, mx.array):
+            result[prefix.rstrip(".")] = grads
+        elif isinstance(grads, dict):
+            for k, v in grads.items():
+                self._flatten_grads(v, f"{prefix}{k}.", result)
+        elif isinstance(grads, (list, tuple)):
+            for i, v in enumerate(grads):
+                self._flatten_grads(v, f"{prefix}{i}.", result)
