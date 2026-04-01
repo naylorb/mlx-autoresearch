@@ -1,4 +1,4 @@
-# autoresearch-mlx
+# autoresearch-mlx-dlx
 
 This is an experiment to have the LLM do its own research.
 
@@ -12,7 +12,7 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
+4. **Verify data exists**: Check that `~/.cache/autoresearch-mlx-dlx/` contains data shards and a tokenizer. Legacy `~/.cache/autoresearch-mlx/` and `~/.cache/autoresearch/` are readable for backward compatibility. If none exist, tell the human to run `uv run prepare.py`.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
@@ -20,7 +20,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single Apple Silicon Mac. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs on a single Apple Silicon Mac. The training script runs for a **fixed time budget of 5 minutes** for training (excluding startup/compilation). Full wall clock can still be materially longer on compact-tier machines because final validation uses a fixed token budget while batch size is smaller. You launch it simply as: `uv run train.py`.
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
@@ -43,7 +43,7 @@ Each experiment runs on a single Apple Silicon Mac. The training script runs for
 `train.py` uses MLX, not PyTorch. Key API differences:
 - `mx.array` not `torch.Tensor`
 - `nn.value_and_grad` not `.backward()`
-- `mx.compile` works and should be preserved
+- `mx.compile` can be used on individual functions but **not on the whole model** — whole-model compile breaks the Muon optimizer's parameter path lookup
 - The `mx.eval()` calls in the gradient accumulation loop are **load-bearing** — they bound peak memory to one micro-step. **Do not remove them.**
 - Unified memory: no CPU/GPU distinction, no `.to(device)` calls needed
 

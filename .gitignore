@@ -12,6 +12,7 @@ wheels/
 # Results and logs
 results/
 run.log
+run_fresh.log
 
 # Credentials and environment
 .env
@@ -19,3 +20,7 @@ credentials.json
 
 # Cache
 .cache/
+
+# Tool-generated local directories
+.claude/
+docs/

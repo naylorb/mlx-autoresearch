@@ -15,7 +15,7 @@ import mlx.nn as nn
 import mlx.optimizers
 from mlx.utils import tree_map
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, EVAL_TOKENS, Tokenizer, make_dataloader, evaluate_bpb
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -34,7 +34,7 @@ class GPTConfig:
 
 def norm(x):
     """RMS norm without learnable weight (matching original's raw F.rms_norm)."""
-    return x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + 1e-6)
+    return x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + 1.1920929e-07)
 
 
 def has_ve(layer_idx, n_layer):
@@ -96,7 +96,9 @@ class CausalSelfAttention(nn.Module):
             mask = mx.triu(mask, k=1 - window)
             y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
         else:
-            y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None)
+            # Full-window but still causal — must mask future tokens
+            mask = mx.tril(mx.ones((T, T), dtype=mx.bool_))
+            y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
 
         y = y.transpose(0, 2, 1, 3).reshape(B, T, -1)
         y = self.c_proj(y)
@@ -439,7 +441,7 @@ class MuonAdamW:
 
         # Pre-classify params for efficient iteration
         self._adamw_paths = []
-        self._muon_groups = {}  # shape -> [paths]
+        self._muon_groups = {}  # shape -> {paths, state_key}
 
         for path, config in param_groups.items():
             config['initial_lr'] = config['lr']
@@ -450,8 +452,11 @@ class MuonAdamW:
                 param = self._get_param(model, path)
                 shape_key = param.shape
                 if shape_key not in self._muon_groups:
-                    self._muon_groups[shape_key] = []
-                self._muon_groups[shape_key].append(path)
+                    self._muon_groups[shape_key] = {
+                        'paths': [],
+                        'state_key': f"muon:{'x'.join(str(dim) for dim in shape_key)}",
+                    }
+                self._muon_groups[shape_key]['paths'].append(path)
 
     def _get_param(self, model, path):
         """Navigate model tree to get parameter at path."""
@@ -516,23 +521,29 @@ class MuonAdamW:
             st['exp_avg_sq'] = new_avg_sq
 
         # Muon updates (batched per shape group)
-        for shape, paths in self._muon_groups.items():
+        for shape, group in self._muon_groups.items():
+            paths = group['paths']
             valid_paths = [p for p in paths if p in flat_grads]
             if not valid_paths:
                 continue
+            if len(valid_paths) != len(paths):
+                missing = [p for p in paths if p not in flat_grads]
+                raise RuntimeError(
+                    f"Missing gradients for Muon parameter group {shape}: {missing}"
+                )
 
-            grads_list = [flat_grads[p] for p in valid_paths]
-            params_list = [self._get_param(model, p) for p in valid_paths]
+            grads_list = [flat_grads[p] for p in paths]
+            params_list = [self._get_param(model, p) for p in paths]
             stacked_grads = mx.stack(grads_list)
             stacked_params = mx.stack(params_list)
 
-            group_key = valid_paths[0]
-            cfg = self.param_groups[group_key]
+            group_key = group['state_key']
+            cfg = self.param_groups[paths[0]]
 
             if group_key not in self.state:
-                state_shape = (len(valid_paths), shape[-2], 1) if shape[-2] >= shape[-1] else (len(valid_paths), 1, shape[-1])
+                state_shape = (len(paths), shape[-2], 1) if shape[-2] >= shape[-1] else (len(paths), 1, shape[-1])
                 self.state[group_key] = {
-                    'momentum_buffer': mx.zeros((len(valid_paths), *shape), dtype=stacked_params.dtype),
+                    'momentum_buffer': mx.zeros((len(paths), *shape), dtype=stacked_params.dtype),
                     'second_momentum_buffer': mx.zeros(state_shape, dtype=stacked_params.dtype),
                 }
             st = self.state[group_key]
@@ -550,7 +561,7 @@ class MuonAdamW:
             st['second_momentum_buffer'] = new_sec_mom
 
             # Unbind and update individual params
-            for i, p in enumerate(valid_paths):
+            for i, p in enumerate(paths):
                 self._set_param(model, p, new_params[i])
 
     def _flatten_grads(self, grads, prefix, result):
@@ -620,7 +631,7 @@ if __name__ == "__main__":
     # Setup: tokenizer, model, optimizer, dataloader
     # ---------------------------------------------------------------------------
 
-    t_start = time.time()
+    t_start = time.perf_counter()
     mx.random.seed(42)
 
     # Display memory tier
@@ -715,7 +726,7 @@ if __name__ == "__main__":
 
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-    t_start_training = time.time()
+    t_start_training = time.perf_counter()
     smooth_train_loss = 0
     total_training_time = 0
     step = 0
@@ -724,18 +735,20 @@ if __name__ == "__main__":
     mx.reset_peak_memory()
 
     while True:
-        t0 = time.time()
+        t0 = time.perf_counter()
 
         # Gradient accumulation with mx.eval per micro-step (Critical note #1)
         # Without mx.eval(), lazy evaluation builds the full computation graph across all
         # micro-steps. On Compact tier (16 steps), this OOMs immediately.
         accumulated_grads = tree_map(mx.zeros_like, model.trainable_parameters())
         total_loss = mx.array(0.0)
+        last_micro_loss = None
 
         for micro_step in range(grad_accum_steps):
             loss, grads = loss_and_grad_fn(model, x, y)
             accumulated_grads = tree_map(lambda a, g: a + g, accumulated_grads, grads)
             total_loss = total_loss + loss
+            last_micro_loss = loss * grad_accum_steps
             # CRITICAL: mx.eval() inside the loop bounds peak memory to ONE micro-step
             mx.eval(total_loss, accumulated_grads)
             x, y, epoch = next(train_loader)  # prefetch next batch
@@ -755,14 +768,14 @@ if __name__ == "__main__":
         optimizer.update(model, accumulated_grads)
         mx.eval(model.parameters())
 
-        train_loss_f = total_loss.item()
+        train_loss_f = last_micro_loss.item()
 
         # Fast fail: abort if loss is exploding
-        if train_loss_f > 100:
+        if math.isnan(train_loss_f) or train_loss_f > 100:
             print("FAIL")
             exit(1)
 
-        t1 = time.time()
+        t1 = time.perf_counter()
         dt = t1 - t0
 
         if step > 10:
@@ -798,10 +811,12 @@ if __name__ == "__main__":
     total_tokens = step * TOTAL_BATCH_SIZE
 
     # Final eval
+    eval_batches = EVAL_TOKENS // (DEVICE_BATCH_SIZE * MAX_SEQ_LEN)
+    print(f"Evaluating val_bpb ({eval_batches} batches at batch_size={DEVICE_BATCH_SIZE})...", flush=True)
     val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
 
     # Final summary
-    t_end = time.time()
+    t_end = time.perf_counter()
     startup_time = t_start_training - t_start
     steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / APPLE_SILICON_BF16_PEAK_FLOPS if total_training_time > 0 else 0
     peak_memory_mb = mx.get_peak_memory() / (1024**2)

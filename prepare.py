@@ -1,12 +1,14 @@
 """
-One-time data preparation for autoresearch-mlx experiments.
+One-time data preparation for autoresearch-mlx-dlx experiments.
 Downloads data shards and trains a BPE tokenizer.
 
 Usage:
     python prepare.py                  # full prep (download + tokenizer)
     python prepare.py --num-shards 8   # download only 8 shards (for testing)
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Data and tokenizer are stored in ~/.cache/autoresearch-mlx-dlx/ by default.
+Set AUTORESEARCH_MLX_DLX_CACHE_DIR to override. Legacy ~/.cache/autoresearch-mlx/
+and ~/.cache/autoresearch/ artifacts are still readable for backward compatibility.
 """
 
 import os
@@ -48,9 +50,16 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 # Configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
+DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch-mlx-dlx")
+LEGACY_CACHE_DIRS = [
+    os.path.join(os.path.expanduser("~"), ".cache", "autoresearch-mlx"),
+    os.path.join(os.path.expanduser("~"), ".cache", "autoresearch"),
+]
+CACHE_DIR = os.environ.get("AUTORESEARCH_MLX_DLX_CACHE_DIR", DEFAULT_CACHE_DIR)
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
+LEGACY_DATA_DIRS = [os.path.join(path, "data") for path in LEGACY_CACHE_DIRS]
+LEGACY_TOKENIZER_DIRS = [os.path.join(path, "tokenizer") for path in LEGACY_CACHE_DIRS]
 BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
 MAX_SHARD = 6542
 VAL_SHARD = MAX_SHARD
@@ -60,6 +69,16 @@ VOCAB_SIZE = 8192
 BOS_TOKEN = "<|reserved_0|>"
 SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+
+
+def _resolve_existing_dir(preferred_dir, fallback_dirs, required_names):
+    """Prefer the publish-safe cache namespace, but read legacy artifacts if needed."""
+    if all(os.path.exists(os.path.join(preferred_dir, name)) for name in required_names):
+        return preferred_dir
+    for fallback_dir in fallback_dirs:
+        if all(os.path.exists(os.path.join(fallback_dir, name)) for name in required_names):
+            return fallback_dir
+    return preferred_dir
 
 # ---------------------------------------------------------------------------
 # Data download
@@ -128,8 +147,9 @@ def download_data(num_shards, download_workers=8):
 
 def list_parquet_files():
     """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+    data_dir = _resolve_existing_dir(DATA_DIR, LEGACY_DATA_DIRS, [VAL_FILENAME])
+    files = sorted(f for f in os.listdir(data_dir) if f.endswith(".parquet") and not f.endswith(".tmp"))
+    return [os.path.join(data_dir, f) for f in files]
 
 
 def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
@@ -223,6 +243,11 @@ class Tokenizer:
 
     @classmethod
     def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
+        tokenizer_dir = _resolve_existing_dir(
+            tokenizer_dir,
+            LEGACY_TOKENIZER_DIRS,
+            ["tokenizer.pkl"],
+        )
         with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
             enc = pickle.load(f)
         return cls(enc)
@@ -255,7 +280,12 @@ class Tokenizer:
 
 def get_token_bytes():
     """Load token byte lengths as mx.array (saved as .npy by train_tokenizer)."""
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
+    tokenizer_dir = _resolve_existing_dir(
+        TOKENIZER_DIR,
+        LEGACY_TOKENIZER_DIRS,
+        ["token_bytes.npy"],
+    )
+    path = os.path.join(tokenizer_dir, "token_bytes.npy")
     return mx.array(np.load(path))
 
 
@@ -263,7 +293,8 @@ def _document_batches(split, tokenizer_batch_size=128):
     """Infinite iterator over document batches from parquet files."""
     parquet_paths = list_parquet_files()
     assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+    data_dir = os.path.dirname(parquet_paths[0])
+    val_path = os.path.join(data_dir, VAL_FILENAME)
     if split == "train":
         parquet_paths = [p for p in parquet_paths if p != val_path]
     else:
@@ -375,7 +406,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch-mlx")
+    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch-mlx-dlx")
     parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
     args = parser.parse_args()
