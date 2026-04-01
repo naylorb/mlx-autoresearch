@@ -563,3 +563,53 @@ class MuonAdamW:
         elif isinstance(grads, (list, tuple)):
             for i, v in enumerate(grads):
                 self._flatten_grads(v, f"{prefix}{i}.", result)
+
+
+# ---------------------------------------------------------------------------
+# Memory Tier System
+# ---------------------------------------------------------------------------
+
+def detect_memory_tier():
+    """Auto-detect system RAM and return (tier_name, total_ram_gb, device_batch_size)."""
+    try:
+        total_ram_gb = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024**3)
+    except (AttributeError, ValueError):
+        total_ram_gb = 8.0  # fallback to Compact
+
+    if total_ram_gb < 12:
+        return "compact", total_ram_gb, 2
+    elif total_ram_gb < 28:
+        return "standard", total_ram_gb, 8
+    elif total_ram_gb < 80:
+        return "pro", total_ram_gb, 16
+    else:
+        return "ultra", total_ram_gb, 32
+
+
+# ---------------------------------------------------------------------------
+# Hyperparameters (edit these directly, no CLI flags needed)
+# ---------------------------------------------------------------------------
+
+# Memory tier auto-detection
+MEMORY_TIER, TOTAL_RAM_GB, AUTO_BATCH_SIZE = detect_memory_tier()
+
+# Model architecture
+ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 128          # target head dimension for attention
+WINDOW_PATTERN = "L"    # sliding window pattern: L=full, S=half context
+
+# Optimization
+TOTAL_BATCH_SIZE = 2**16 # ~65K tokens per optimizer step
+EMBEDDING_LR = 0.6
+UNEMBEDDING_LR = 0.004
+MATRIX_LR = 0.04
+SCALAR_LR = 0.5
+WEIGHT_DECAY = 0.2
+ADAM_BETAS = (0.8, 0.95)
+WARMUP_RATIO = 0.0
+WARMDOWN_RATIO = 0.5
+FINAL_LR_FRAC = 0.0
+
+# Model size
+DEPTH = 4
+DEVICE_BATCH_SIZE = AUTO_BATCH_SIZE  # auto-detected from memory tier (override by editing directly)
