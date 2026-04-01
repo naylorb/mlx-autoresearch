@@ -1,0 +1,347 @@
+"""
+Autoresearch-MLX pretraining script. Single-file, Apple Silicon native.
+Usage: uv run train.py
+"""
+
+import os
+import gc
+import sys
+import time
+import math
+from dataclasses import dataclass, asdict
+
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers
+from mlx.utils import tree_map
+
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+
+# ---------------------------------------------------------------------------
+# GPT Model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GPTConfig:
+    sequence_len: int = 2048
+    vocab_size: int = 32768
+    n_layer: int = 12
+    n_head: int = 6
+    n_kv_head: int = 6
+    n_embd: int = 768
+    window_pattern: str = "SSSL"
+
+
+def norm(x):
+    """RMS norm without learnable weight (matching original's raw F.rms_norm)."""
+    return x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + 1e-6)
+
+
+def has_ve(layer_idx, n_layer):
+    """Returns True if layer should have Value Embedding (alternating, last always included)."""
+    return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def apply_rotary_emb(x, cos, sin):
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return mx.concatenate([y1, y2], axis=3)
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.ve_gate_channels = 32
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+
+    def __call__(self, x, ve, cos_sin, window_size):
+        B, T, C = x.shape
+        q = self.c_q(x).reshape(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).reshape(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).reshape(B, T, self.n_kv_head, self.head_dim)
+
+        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+        if ve is not None:
+            ve = ve.reshape(B, T, self.n_kv_head, self.head_dim)
+            gate = 2 * mx.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            v = v + mx.expand_dims(gate, axis=-1) * ve
+
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = norm(q), norm(k)
+
+        # Transpose to [B, H, T, D] for SDPA
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        # MLX SDPA handles GQA natively — no need to expand k,v heads
+        scale = 1.0 / math.sqrt(self.head_dim)
+        window = window_size[0]
+        if window > 0 and window < T:
+            # Sliding window via custom boolean mask
+            mask = mx.tril(mx.ones((T, T), dtype=mx.bool_))
+            mask = mx.triu(mask, k=1 - window)
+            y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+        else:
+            y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=None)
+
+        y = y.transpose(0, 2, 1, 3).reshape(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def __call__(self, x):
+        x = self.c_fc(x)
+        x = mx.square(nn.relu(x))
+        x = self.c_proj(x)
+        return x
+
+
+class Block(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.attn = CausalSelfAttention(config, layer_idx)
+        self.mlp = MLP(config)
+
+    def __call__(self, x, ve, cos_sin, window_size):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+        x = x + self.mlp(norm(x))
+        return x
+
+
+class GPT(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.window_sizes = self._compute_window_sizes(config)
+
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.blocks = [Block(config, i) for i in range(config.n_layer)]
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.resid_lambdas = mx.ones((config.n_layer,))
+        self.x0_lambdas = mx.zeros((config.n_layer,))
+
+        # Value embeddings
+        head_dim = config.n_embd // config.n_head
+        kv_dim = config.n_kv_head * head_dim
+        self.value_embeds = {
+            str(i): nn.Embedding(config.vocab_size, kv_dim)
+            for i in range(config.n_layer) if has_ve(i, config.n_layer)
+        }
+
+        # Rotary embeddings — precomputed, then frozen
+        rotary_seq_len = config.sequence_len * 10
+        cos, sin = self._precompute_rotary_embeddings(rotary_seq_len, head_dim)
+        self.cos = cos
+        self.sin = sin
+        # Freeze so nn.value_and_grad skips these (Critical note #11)
+        self.freeze(keys=["cos", "sin"])
+
+    def init_weights(self):
+        n_embd = self.config.n_embd
+        s = 3**0.5 * n_embd**-0.5
+        # Embedding and unembedding
+        self.wte.weight = mx.random.normal(self.wte.weight.shape).astype(mx.bfloat16)
+        self.lm_head.weight = mx.random.normal(self.lm_head.weight.shape) * 0.001
+
+        # Transformer blocks
+        for block in self.blocks:
+            block.attn.c_q.weight = mx.random.uniform(-s, s, block.attn.c_q.weight.shape)
+            block.attn.c_k.weight = mx.random.uniform(-s, s, block.attn.c_k.weight.shape)
+            block.attn.c_v.weight = mx.random.uniform(-s, s, block.attn.c_v.weight.shape)
+            block.attn.c_proj.weight = mx.zeros_like(block.attn.c_proj.weight)
+            block.mlp.c_fc.weight = mx.random.uniform(-s, s, block.mlp.c_fc.weight.shape)
+            block.mlp.c_proj.weight = mx.zeros_like(block.mlp.c_proj.weight)
+
+        # Per-layer scalars
+        self.resid_lambdas = mx.ones((self.config.n_layer,))
+        self.x0_lambdas = mx.full((self.config.n_layer,), 0.1)
+
+        # Value embeddings
+        for ve in self.value_embeds.values():
+            ve.weight = mx.random.uniform(-s, s, ve.weight.shape).astype(mx.bfloat16)
+
+        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
+        for block in self.blocks:
+            if block.attn.ve_gate is not None:
+                block.attn.ve_gate.weight = mx.zeros_like(block.attn.ve_gate.weight)
+
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000):
+        channel_range = mx.arange(0, head_dim, 2, dtype=mx.float32)
+        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        t = mx.arange(seq_len, dtype=mx.float32)
+        freqs = mx.outer(t, inv_freq)
+        cos = mx.cos(freqs).astype(mx.bfloat16)
+        sin = mx.sin(freqs).astype(mx.bfloat16)
+        # Shape: [1, T, 1, D//2] for broadcasting with [B, T, H, D//2]
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+        return cos, sin
+
+    def _compute_window_sizes(self, config):
+        pattern = config.window_pattern.upper()
+        assert all(c in "SL" for c in pattern)
+        long_window = config.sequence_len
+        short_window = long_window // 2
+        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+        window_sizes = []
+        for layer_idx in range(config.n_layer):
+            char = pattern[layer_idx % len(pattern)]
+            window_sizes.append(char_to_window[char])
+        window_sizes[-1] = (long_window, 0)
+        return window_sizes
+
+    def estimate_flops(self):
+        """Estimated FLOPs per token (forward + backward)."""
+        params = self.parameters()
+        nparams = sum(x.size for x in self._iter_params(params))
+
+        value_embeds_numel = sum(ve.weight.size for ve in self.value_embeds.values())
+        wte_numel = self.wte.weight.size
+        resid_numel = self.resid_lambdas.size
+        x0_numel = self.x0_lambdas.size
+        nparams_exclude = wte_numel + value_embeds_numel + resid_numel + x0_numel
+
+        h = self.config.n_head
+        q = self.config.n_embd // self.config.n_head
+        t = self.config.sequence_len
+        attn_flops = 0
+        for window_size in self.window_sizes:
+            window = window_size[0]
+            effective_seq = t if window < 0 else min(window, t)
+            attn_flops += 12 * h * q * effective_seq
+        return 6 * (nparams - nparams_exclude) + attn_flops
+
+    def _iter_params(self, params):
+        """Recursively iterate over all leaf mx.array parameters."""
+        if isinstance(params, mx.array):
+            yield params
+        elif isinstance(params, dict):
+            for v in params.values():
+                yield from self._iter_params(v)
+        elif isinstance(params, (list, tuple)):
+            for v in params:
+                yield from self._iter_params(v)
+
+    def count_params(self):
+        """Count total trainable parameters."""
+        return sum(x.size for x in self._iter_params(self.trainable_parameters()))
+
+    def count_all_params(self):
+        """Count all parameters (including frozen)."""
+        return sum(x.size for x in self._iter_params(self.parameters()))
+
+    def num_scaling_params(self):
+        wte = self.wte.weight.size
+        value_embeds = sum(ve.weight.size for ve in self.value_embeds.values())
+        lm_head = self.lm_head.weight.size
+        transformer_matrices = sum(
+            x.size for block in self.blocks
+            for x in self._iter_params(block.parameters())
+        )
+        scalars = self.resid_lambdas.size + self.x0_lambdas.size
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        return {
+            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
+            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
+        }
+
+    def setup_optimizer_groups(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
+                               weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+        """Classify parameters into optimizer groups by path.
+
+        Returns a dict mapping each parameter path to its optimizer config:
+        {param_path: {kind: "muon"|"adamw", lr: ..., ...}}
+        """
+        model_dim = self.config.n_embd
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
+
+        groups = {}
+
+        # Classify each parameter by its path
+        for path, param in self._all_params_with_paths():
+            if "wte" in path:
+                groups[path] = dict(kind='adamw', lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0)
+            elif "lm_head" in path:
+                groups[path] = dict(kind='adamw', lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0)
+            elif "value_embeds" in path:
+                groups[path] = dict(kind='adamw', lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0)
+            elif path == "resid_lambdas":
+                groups[path] = dict(kind='adamw', lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0)
+            elif path == "x0_lambdas":
+                groups[path] = dict(kind='adamw', lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0)
+            elif "blocks" in path and "weight" in path:
+                groups[path] = dict(kind='muon', lr=matrix_lr, momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay)
+            # Skip frozen params (cos, sin)
+
+        return groups
+
+    def _all_params_with_paths(self, prefix=""):
+        """Yield (path, param) for all trainable parameters."""
+        for path_part, value in self.trainable_parameters().items():
+            full_path = f"{prefix}{path_part}" if prefix else path_part
+            if isinstance(value, mx.array):
+                yield full_path, value
+            elif isinstance(value, dict):
+                for sub_path, sub_val in self._flatten_params(value, full_path + "."):
+                    yield sub_path, sub_val
+            elif isinstance(value, (list, tuple)):
+                for i, item in enumerate(value):
+                    for sub_path, sub_val in self._flatten_params(item, f"{full_path}.{i}."):
+                        yield sub_path, sub_val
+
+    def _flatten_params(self, obj, prefix):
+        if isinstance(obj, mx.array):
+            yield prefix.rstrip("."), obj
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                yield from self._flatten_params(v, f"{prefix}{k}.")
+        elif isinstance(obj, (list, tuple)):
+            for i, v in enumerate(obj):
+                yield from self._flatten_params(v, f"{prefix}{i}.")
+
+    def __call__(self, idx, targets=None, reduction='mean'):
+        B, T = idx.shape
+        assert T <= self.cos.shape[1]
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+
+        x = self.wte(idx)
+        x = norm(x)
+        x0 = x
+        for i, block in enumerate(self.blocks):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            x = block(x, ve, cos_sin, self.window_sizes[i])
+        x = norm(x)
+
+        softcap = 15
+        logits = self.lm_head(x)
+        # Explicit float32 for numerical stability (Critical note #4)
+        logits = logits.astype(mx.float32)
+        logits = softcap * mx.tanh(logits / softcap)
+
+        if targets is not None:
+            # Cross-entropy in float32 (Critical note #4)
+            loss = mx.mean(nn.losses.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction='none')) if reduction == 'mean' else nn.losses.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction='none')
+            return loss
+        return logits
