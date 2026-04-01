@@ -614,203 +614,206 @@ FINAL_LR_FRAC = 0.0
 DEPTH = 4
 DEVICE_BATCH_SIZE = AUTO_BATCH_SIZE  # auto-detected from memory tier (override by editing directly)
 
-# ---------------------------------------------------------------------------
-# Setup: tokenizer, model, optimizer, dataloader
-# ---------------------------------------------------------------------------
+if __name__ == "__main__":
 
-t_start = time.time()
-mx.random.seed(42)
+    # ---------------------------------------------------------------------------
+    # Setup: tokenizer, model, optimizer, dataloader
+    # ---------------------------------------------------------------------------
 
-# Display memory tier
-usable_gb = max(0, TOTAL_RAM_GB - 3)  # ~3GB for macOS
-print(f"Memory tier: {MEMORY_TIER.title()} ({TOTAL_RAM_GB:.0f}GB detected, ~{usable_gb:.0f}GB usable for training)")
-print(f"DEVICE_BATCH_SIZE auto-set to {DEVICE_BATCH_SIZE} (override by editing directly)")
-print()
+    t_start = time.time()
+    mx.random.seed(42)
 
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
+    # Display memory tier
+    usable_gb = max(0, TOTAL_RAM_GB - 3)  # ~3GB for macOS
+    print(f"Memory tier: {MEMORY_TIER.title()} ({TOTAL_RAM_GB:.0f}GB detected, ~{usable_gb:.0f}GB usable for training)")
+    print(f"DEVICE_BATCH_SIZE auto-set to {DEVICE_BATCH_SIZE} (override by editing directly)")
+    print()
 
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
+    tokenizer = Tokenizer.from_directory()
+    vocab_size = tokenizer.get_vocab_size()
+    print(f"Vocab size: {vocab_size:,}")
+
+    def build_model_config(depth):
+        base_dim = depth * ASPECT_RATIO
+        model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
+        num_heads = model_dim // HEAD_DIM
+        return GPTConfig(
+            sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
+            n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+            window_pattern=WINDOW_PATTERN,
+        )
+
+    config = build_model_config(DEPTH)
+    print(f"Model config: {asdict(config)}")
+
+    # Create model — no meta device dance needed (MLX is lazy)
+    model = GPT(config)
+    model.init_weights()
+
+    param_counts = model.num_scaling_params()
+    print("Parameter counts:")
+    for key, value in param_counts.items():
+        print(f"  {key:24s}: {value:,}")
+    num_params = param_counts['total']
+    num_flops_per_token = model.estimate_flops()
+    print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+
+    tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+    assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+    grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+
+    # Build optimizer
+    param_group_config = model.setup_optimizer_groups(
+        unembedding_lr=UNEMBEDDING_LR,
+        embedding_lr=EMBEDDING_LR,
+        scalar_lr=SCALAR_LR,
+        adam_betas=ADAM_BETAS,
+        matrix_lr=MATRIX_LR,
+        weight_decay=WEIGHT_DECAY,
     )
+    optimizer = MuonAdamW(model, param_group_config)
 
-config = build_model_config(DEPTH)
-print(f"Model config: {asdict(config)}")
+    # Note: mx.compile on model object breaks optimizer's path-based parameter
+    # navigation. Optimizer step functions (adamw_step, muon_step) are already
+    # compiled individually — that's where the perf benefit comes from.
 
-# Create model — no meta device dance needed (MLX is lazy)
-model = GPT(config)
-model.init_weights()
+    train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+    x, y, epoch = next(train_loader)  # prefetch first batch
 
-param_counts = model.num_scaling_params()
-print("Parameter counts:")
-for key, value in param_counts.items():
-    print(f"  {key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+    print(f"Time budget: {TIME_BUDGET}s")
+    print(f"Gradient accumulation steps: {grad_accum_steps}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+    # Approximate peak FLOPs for Apple Silicon (M1/M2/M3 class)
+    # Conservative estimate: ~2 TFLOPS bf16 for base chips
+    APPLE_SILICON_BF16_PEAK_FLOPS = 2e12
 
-# Build optimizer
-param_group_config = model.setup_optimizer_groups(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
-)
-optimizer = MuonAdamW(model, param_group_config)
+    # Schedules (all based on progress = training_time / TIME_BUDGET)
 
-# Compile model (mx.compile actually works on Apple Silicon!)
-model = mx.compile(model)
+    def get_lr_multiplier(progress):
+        if progress < WARMUP_RATIO:
+            return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+        elif progress < 1.0 - WARMDOWN_RATIO:
+            return 1.0
+        else:
+            cooldown = (1.0 - progress) / WARMDOWN_RATIO
+            return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
+    def get_muon_momentum(step):
+        frac = min(step / 300, 1)
+        return (1 - frac) * 0.85 + frac * 0.95
 
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
+    def get_weight_decay(progress):
+        return WEIGHT_DECAY * (1 - progress)
 
-# Approximate peak FLOPs for Apple Silicon (M1/M2/M3 class)
-# Conservative estimate: ~2 TFLOPS bf16 for base chips
-APPLE_SILICON_BF16_PEAK_FLOPS = 2e12
+    # ---------------------------------------------------------------------------
+    # Training loop
+    # ---------------------------------------------------------------------------
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
+    # Loss function pre-scales by grad_accum_steps (Critical note #2)
+    def loss_fn(model, x, y):
+        return model(x, y) / grad_accum_steps
 
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
+    t_start_training = time.time()
+    smooth_train_loss = 0
+    total_training_time = 0
+    step = 0
 
-def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    # Reset peak memory for accurate measurement (Critical note #9)
+    mx.reset_peak_memory()
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
+    while True:
+        t0 = time.time()
 
-# Loss function pre-scales by grad_accum_steps (Critical note #2)
-def loss_fn(model, x, y):
-    return model(x, y) / grad_accum_steps
+        # Gradient accumulation with mx.eval per micro-step (Critical note #1)
+        # Without mx.eval(), lazy evaluation builds the full computation graph across all
+        # micro-steps. On Compact tier (16 steps), this OOMs immediately.
+        accumulated_grads = tree_map(mx.zeros_like, model.trainable_parameters())
+        total_loss = mx.array(0.0)
 
-loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        for micro_step in range(grad_accum_steps):
+            loss, grads = loss_and_grad_fn(model, x, y)
+            accumulated_grads = tree_map(lambda a, g: a + g, accumulated_grads, grads)
+            total_loss = total_loss + loss
+            # CRITICAL: mx.eval() inside the loop bounds peak memory to ONE micro-step
+            mx.eval(total_loss, accumulated_grads)
+            x, y, epoch = next(train_loader)  # prefetch next batch
 
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
+        # Progress and schedules
+        progress = min(total_training_time / TIME_BUDGET, 1.0)
+        lrm = get_lr_multiplier(progress)
+        muon_momentum = get_muon_momentum(step)
+        muon_weight_decay = get_weight_decay(progress)
 
-# Reset peak memory for accurate measurement (Critical note #9)
-mx.reset_peak_memory()
+        for path, cfg in optimizer.param_groups.items():
+            cfg['lr'] = cfg['initial_lr'] * lrm
+            if cfg['kind'] == 'muon':
+                cfg['momentum'] = muon_momentum
+                cfg['weight_decay'] = muon_weight_decay
 
-while True:
-    t0 = time.time()
+        optimizer.update(model, accumulated_grads)
+        mx.eval(model.parameters())
 
-    # Gradient accumulation with mx.eval per micro-step (Critical note #1)
-    # Without mx.eval(), lazy evaluation builds the full computation graph across all
-    # micro-steps. On Compact tier (16 steps), this OOMs immediately.
-    accumulated_grads = tree_map(mx.zeros_like, model.trainable_parameters())
-    total_loss = mx.array(0.0)
+        train_loss_f = total_loss.item()
 
-    for micro_step in range(grad_accum_steps):
-        loss, grads = loss_and_grad_fn(model, x, y)
-        accumulated_grads = tree_map(lambda a, g: a + g, accumulated_grads, grads)
-        total_loss = total_loss + loss
-        # CRITICAL: mx.eval() inside the loop bounds peak memory to ONE micro-step
-        mx.eval(total_loss, accumulated_grads)
-        x, y, epoch = next(train_loader)  # prefetch next batch
+        # Fast fail: abort if loss is exploding
+        if train_loss_f > 100:
+            print("FAIL")
+            exit(1)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
+        t1 = time.time()
+        dt = t1 - t0
 
-    for path, cfg in optimizer.param_groups.items():
-        cfg['lr'] = cfg['initial_lr'] * lrm
-        if cfg['kind'] == 'muon':
-            cfg['momentum'] = muon_momentum
-            cfg['weight_decay'] = muon_weight_decay
+        if step > 10:
+            total_training_time += dt
 
-    optimizer.update(model, accumulated_grads)
-    mx.eval(model.parameters())
+        # Logging
+        ema_beta = 0.9
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
+        pct_done = 100 * progress
+        tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+        mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / APPLE_SILICON_BF16_PEAK_FLOPS
+        remaining = max(0, TIME_BUDGET - total_training_time)
 
-    train_loss_f = total_loss.item()
+        print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
-    # Fast fail: abort if loss is exploding
-    if train_loss_f > 100:
-        print("FAIL")
-        exit(1)
+        # GC management (Python's GC causes ~500ms stalls)
+        if step == 0:
+            gc.collect()
+            gc.freeze()
+            gc.disable()
+        elif (step + 1) % 5000 == 0:
+            gc.collect()
 
-    t1 = time.time()
-    dt = t1 - t0
+        step += 1
 
-    if step > 10:
-        total_training_time += dt
+        # Time's up — but only stop after warmup steps so we don't count compilation
+        if step > 10 and total_training_time >= TIME_BUDGET:
+            break
 
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / APPLE_SILICON_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+    print()  # newline after \r training log
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    total_tokens = step * TOTAL_BATCH_SIZE
 
-    # GC management (Python's GC causes ~500ms stalls)
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
+    # Final eval
+    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
 
-    step += 1
+    # Final summary
+    t_end = time.time()
+    startup_time = t_start_training - t_start
+    steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / APPLE_SILICON_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+    peak_memory_mb = mx.get_peak_memory() / (1024**2)
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
-
-print()  # newline after \r training log
-
-total_tokens = step * TOTAL_BATCH_SIZE
-
-# Final eval
-val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
-
-# Final summary
-t_end = time.time()
-startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / APPLE_SILICON_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_memory_mb = mx.get_peak_memory() / (1024**2)
-
-print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_memory_mb:   {peak_memory_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
-print(f"memory_tier:      {MEMORY_TIER}")
+    print("---")
+    print(f"val_bpb:          {val_bpb:.6f}")
+    print(f"training_seconds: {total_training_time:.1f}")
+    print(f"total_seconds:    {t_end - t_start:.1f}")
+    print(f"peak_memory_mb:   {peak_memory_mb:.1f}")
+    print(f"mfu_percent:      {steady_state_mfu:.2f}")
+    print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
+    print(f"num_steps:        {step}")
+    print(f"num_params_M:     {num_params / 1e6:.1f}")
+    print(f"depth:            {DEPTH}")
+    print(f"memory_tier:      {MEMORY_TIER}")
