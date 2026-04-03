@@ -750,6 +750,18 @@ if __name__ == "__main__":
     assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
     grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
+    if "--dry-run" in sys.argv:
+        print()
+        print("--- dry run summary ---")
+        print(f"Memory tier:              {MEMORY_TIER}")
+        print(f"Device batch size:        {DEVICE_BATCH_SIZE}")
+        print(f"Gradient accumulation:    {grad_accum_steps}")
+        print(f"Total batch size:         {TOTAL_BATCH_SIZE:,} tokens")
+        print(f"Total parameters:         {num_params:,}")
+        print(f"Trainable parameters:     {model.count_params():,}")
+        print(f"FLOPs per token:          {num_flops_per_token:e}")
+        sys.exit(0)
+
     # Build optimizer
     param_group_config = model.setup_optimizer_groups(
         unembedding_lr=UNEMBEDDING_LR,
