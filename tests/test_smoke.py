@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import io
+import operator
 import platform
 import re
 import sys
@@ -37,6 +38,25 @@ metal = pytest.mark.skipif(not HAS_MLX, reason="requires Apple Silicon with MLX"
 
 def read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+_SAFE_OPS = {ast.Add: operator.add, ast.Sub: operator.sub,
+             ast.Mult: operator.mul, ast.Pow: operator.pow}
+
+def safe_eval_const(expr: str) -> int | float:
+    """Evaluate a constant numeric expression (literals + basic arithmetic only)."""
+    tree = ast.parse(expr, mode="eval")
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPS:
+            return _SAFE_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -_eval(node.operand)
+        raise ValueError(f"unsafe expression: {ast.dump(node)}")
+    return _eval(tree)
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +218,8 @@ class TestMemoryTierBatchAlignment:
     def test_batch_alignment(self, device_batch_size):
         # Extract constants from source to avoid importing MLX
         src = read(TRAIN)
-        match = re.search(r"TOTAL_BATCH_SIZE\s*=\s*(.+)", src)
-        total_batch = eval(match.group(1))
+        match = re.search(r"TOTAL_BATCH_SIZE\s*=\s*(.+?)(?:\s*#|$)", src, re.MULTILINE)
+        total_batch = safe_eval_const(match.group(1).strip())
         src_p = read(PREPARE)
         match_seq = re.search(r"MAX_SEQ_LEN\s*=\s*(\d+)", src_p)
         max_seq = int(match_seq.group(1))
@@ -232,7 +252,7 @@ class TestHyperparamPositive:
         src = read(TRAIN)
         match = re.search(rf"^{name}\s*=\s*(.+?)(?:\s*#|$)", src, re.MULTILINE)
         assert match, f"{name} not found"
-        val = eval(match.group(1).strip())
+        val = safe_eval_const(match.group(1).strip())
         assert val > 0, f"{name} = {val} is not positive"
 
 
