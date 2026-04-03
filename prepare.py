@@ -16,6 +16,7 @@ import sys
 import time
 import math
 import argparse
+import hashlib
 import pickle
 from multiprocessing import Pool
 
@@ -35,8 +36,6 @@ def verify_env():
         raise RuntimeError("MLX is not available. Ensure you are running on Apple Silicon with MLX installed.")
     print("Environment verified: macOS detected with MLX (Apple Silicon) acceleration available.")
     print()
-
-verify_env()
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
@@ -103,6 +102,8 @@ def download_single_shard(index):
                     if chunk:
                         f.write(chunk)
             os.rename(temp_path, filepath)
+            # Note: No checksum verification — HuggingFace doesn't provide per-shard hashes.
+            # PyArrow will raise on read if the file is truncated or corrupt.
             print(f"  Downloaded {filename}")
             return True
         except (requests.RequestException, IOError) as e:
@@ -205,6 +206,11 @@ def train_tokenizer():
     with open(tokenizer_pkl, "wb") as f:
         pickle.dump(enc, f)
 
+    with open(tokenizer_pkl, "rb") as f:
+        sha256 = hashlib.sha256(f.read()).hexdigest()
+    with open(tokenizer_pkl + ".sha256", "w") as f:
+        f.write(sha256)
+
     t1 = time.time()
     print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
 
@@ -248,7 +254,25 @@ class Tokenizer:
             LEGACY_TOKENIZER_DIRS,
             ["tokenizer.pkl"],
         )
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
+        pkl_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
+        sha_path = pkl_path + ".sha256"
+        if os.path.exists(sha_path):
+            with open(sha_path, "r") as f:
+                expected = f.read().strip()
+            with open(pkl_path, "rb") as f:
+                actual = hashlib.sha256(f.read()).hexdigest()
+            if actual != expected:
+                raise RuntimeError(
+                    f"Tokenizer integrity check failed: {pkl_path}\n"
+                    f"Expected SHA-256: {expected}\n"
+                    f"Actual SHA-256:   {actual}\n"
+                    "The tokenizer file may have been tampered with. "
+                    "Re-run 'python prepare.py' to regenerate."
+                )
+        else:
+            print(f"Warning: No SHA-256 hash found for {pkl_path}. "
+                  "Integrity cannot be verified (legacy tokenizer).")
+        with open(pkl_path, "rb") as f:
             enc = pickle.load(f)
         return cls(enc)
 
@@ -313,8 +337,9 @@ def _document_batches(split, tokenizer_batch_size=128):
 
 def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
+    Best-fit packing dataloader with BOS-prefixed documents.
+    Fresh documents begin with BOS. Cropped continuations are re-queued without
+    inserting a synthetic BOS so no tokens are lost.
     Yields (inputs, targets, epoch) as mx.array — no CPU/GPU buffer management needed
     since MLX uses unified memory.
     """
@@ -324,6 +349,8 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     epoch = 1
+    cropped_tokens_total = 0
+    last_logged_cropped_tokens = 0
 
     def refill_buffer():
         nonlocal epoch
@@ -361,12 +388,21 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
                     shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
                     doc = doc_buffer.pop(shortest_idx)
                     row_buffer[row_idx, pos:pos + remaining] = doc[:remaining]
+                    tail = doc[remaining:]
+                    if tail:
+                        doc_buffer.insert(shortest_idx, tail)
+                    cropped_tokens_total += len(tail)
                     pos += remaining
 
         # Create mx.array directly — unified memory, immediately available
         data = mx.array(row_buffer)
         inputs = data[:, :-1]
         targets = data[:, 1:]
+        if cropped_tokens_total and (
+            last_logged_cropped_tokens == 0 or cropped_tokens_total - last_logged_cropped_tokens >= 1000
+        ):
+            print(f"dataloader: cropped_tokens={cropped_tokens_total}")
+            last_logged_cropped_tokens = cropped_tokens_total
         yield inputs, targets, epoch
 
 
@@ -406,6 +442,8 @@ def evaluate_bpb(model, tokenizer, batch_size):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    verify_env()
+
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch-mlx-dlx")
     parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
     parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")

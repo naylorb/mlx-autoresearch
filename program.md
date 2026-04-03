@@ -32,6 +32,8 @@ Each experiment runs on a single Apple Silicon Mac. The training script runs for
 
 **The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
 
+**Statistical noise matters**: small BPB differences can be noise. As a rule of thumb, treat improvements smaller than about 0.003-0.005 BPB as provisional unless the change is also clearly simpler, cheaper, or repeatedly reproduced.
+
 **System memory** is a soft constraint. The training output shows the detected memory tier and available system memory. On Compact tier (8GB), memory is a hard constraint — be cautious with model size increases. Some increase is acceptable on larger tiers for meaningful val_bpb gains, but it should not blow up dramatically.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.

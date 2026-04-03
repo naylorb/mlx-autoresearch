@@ -20,6 +20,13 @@ credentials.json
 
 # Cache
 .cache/
+.DS_Store
+
+# Dev-only scripts
+simulate_run.py
+
+# Output artifacts
+results.tsv
 
 # Tool-generated local directories
 .claude/

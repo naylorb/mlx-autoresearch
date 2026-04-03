@@ -3,7 +3,11 @@ name = "autoresearch-mlx-dlx"
 version = "0.1.0"
 description = "Autonomous pretraining research — native Apple Silicon with MLX"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
+authors = [
+    { name = "naylorb" },
+]
 dependencies = [
     "mlx==0.31.1",
     "numpy==2.2.6",
@@ -12,3 +16,6 @@ dependencies = [
     "rustbpe==0.1.0",
     "tiktoken==0.11.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/naylorb/mlx-autoresearch"

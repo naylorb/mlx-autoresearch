@@ -18,15 +18,24 @@ But it requires PyTorch with CUDA — or at minimum, 16GB of unified memory on m
 
 Same model architecture. Same optimizer. Same evaluation metric. Just native.
 
+This repository is nominally about ML pretraining, but the underlying autoresearch loop is broader than ML. The core pattern is simple: let an agent edit a program, run it under a fixed budget, measure a scalar outcome, and keep or discard the change. In ML that scalar is `val_bpb`; in other systems it could be latency, compression ratio, success rate, resource usage, or some weighted score. The same structure can be used to refine any program that can be benchmarked reproducibly.
+
 ## Quick start
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh   # install uv (~5 seconds)
-git clone https://github.com/naylorb/autoresearch-mlx-dlx.git
+git clone https://github.com/naylorb/mlx-autoresearch.git
 cd autoresearch-mlx-dlx
 uv sync                                              # ~30 seconds (no 2GB torch)
-uv run prepare.py                                    # download data + train tokenizer
+uv run prepare.py --num-shards 2                     # minimum viable: 1 train + 1 val shard
 uv run train.py                                      # runs on any Apple Silicon Mac
+```
+
+For longer experiments, download more shards first:
+
+```bash
+uv run prepare.py                                    # default: 10 shards + tokenizer
+uv run prepare.py --num-shards -1                    # all 6542 shards (~400B tokens)
 ```
 
 ## Comparison
@@ -76,6 +85,8 @@ See `program.md` for the full agent protocol. The short version:
 ## Design choices
 
 - **MLX over PyTorch MPS**: MPS is a compatibility layer that patches PyTorch to work on Apple Silicon. MLX is native — designed from the ground up for Apple's unified memory architecture. No FlashAttention workarounds, no device casting guards, and no need for explicit CPU/GPU buffer choreography.
+
+- **Built MLX-native from the ground up**: This is not a thin backend swap. The model, optimizer, memory behavior, eval boundaries, compiled step kernels, and unified-memory assumptions were implemented specifically for MLX so the project stays performant and memory-bounded on real Apple Silicon machines, including compact 8GB systems like a MacBook Neo.
 
 - **Single-file philosophy**: Karpathy's constraint (one editable file, one read-only file, one instruction file) is preserved. The agent only touches `train.py`.
 

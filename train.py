@@ -8,6 +8,7 @@ import gc
 import sys
 import time
 import math
+import subprocess
 from dataclasses import dataclass, asdict
 
 import mlx.core as mx
@@ -20,6 +21,8 @@ from prepare import MAX_SEQ_LEN, TIME_BUDGET, EVAL_TOKENS, Tokenizer, make_datal
 # ---------------------------------------------------------------------------
 # GPT Model
 # ---------------------------------------------------------------------------
+
+EPS = 1.1920929e-07  # float32 machine epsilon
 
 @dataclass
 class GPTConfig:
@@ -34,7 +37,7 @@ class GPTConfig:
 
 def norm(x):
     """RMS norm without learnable weight (matching original's raw F.rms_norm)."""
-    return x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + 1.1920929e-07)
+    return x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + EPS)
 
 
 def has_ve(layer_idx, n_layer):
@@ -45,6 +48,7 @@ def has_ve(layer_idx, n_layer):
 def apply_rotary_emb(x, cos, sin):
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
+    # Concat-style RoPE with the standard negative-sin-on-second-row convention.
     y1 = x1 * cos + x2 * sin
     y2 = x1 * (-sin) + x2 * cos
     return mx.concatenate([y1, y2], axis=3)
@@ -66,7 +70,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def __call__(self, x, ve, cos_sin, window_size):
+    def __call__(self, x, ve, cos_sin, window_size, mask):
         B, T, C = x.shape
         q = self.c_q(x).reshape(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).reshape(B, T, self.n_kv_head, self.head_dim)
@@ -89,16 +93,9 @@ class CausalSelfAttention(nn.Module):
 
         # MLX SDPA handles GQA natively — no need to expand k,v heads
         scale = 1.0 / math.sqrt(self.head_dim)
-        window = window_size[0]
-        if window > 0 and window < T:
-            # Sliding window via custom boolean mask
-            mask = mx.tril(mx.ones((T, T), dtype=mx.bool_))
-            mask = mx.triu(mask, k=1 - window)
-            y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
-        else:
-            # Full-window but still causal — must mask future tokens
-            mask = mx.tril(mx.ones((T, T), dtype=mx.bool_))
-            y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+        # Use precomputed causal mask (sliced to current sequence length)
+        attn_mask = mask[:T, :T]
+        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=attn_mask)
 
         y = y.transpose(0, 2, 1, 3).reshape(B, T, -1)
         y = self.c_proj(y)
@@ -124,8 +121,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def __call__(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def __call__(self, x, ve, cos_sin, window_size, mask):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -139,6 +136,8 @@ class GPT(nn.Module):
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.blocks = [Block(config, i) for i in range(config.n_layer)]
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Plain mx.array attributes — MLX's nn.Module introspects these as trainable
+        # parameters automatically. No wrapper needed unlike PyTorch.
         self.resid_lambdas = mx.ones((config.n_layer,))
         self.x0_lambdas = mx.zeros((config.n_layer,))
 
@@ -155,8 +154,19 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(rotary_seq_len, head_dim)
         self.cos = cos
         self.sin = sin
+        # Precompute causal masks for all unique window sizes (avoids recomputing per layer/step)
+        T = config.sequence_len
+        full_causal = mx.tril(mx.ones((T, T), dtype=mx.bool_))
+        unique_windows = set(self.window_sizes)
+        self._masks = {}
+        for ws in unique_windows:
+            if ws > 0 and ws < T:
+                self._masks[ws] = mx.triu(full_causal, k=1 - ws)
+            else:
+                self._masks[ws] = full_causal
+
         # Freeze so nn.value_and_grad skips these (Critical note #11)
-        self.freeze(keys=["cos", "sin"])
+        self.freeze(keys=["cos", "sin", "_masks"])
 
     def init_weights(self):
         n_embd = self.config.n_embd
@@ -204,12 +214,12 @@ class GPT(nn.Module):
         assert all(c in "SL" for c in pattern)
         long_window = config.sequence_len
         short_window = long_window // 2
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
+        char_to_window = {"L": long_window, "S": short_window}
         window_sizes = []
         for layer_idx in range(config.n_layer):
             char = pattern[layer_idx % len(pattern)]
             window_sizes.append(char_to_window[char])
-        window_sizes[-1] = (long_window, 0)
+        window_sizes[-1] = long_window
         return window_sizes
 
     def estimate_flops(self):
@@ -228,8 +238,7 @@ class GPT(nn.Module):
         t = self.config.sequence_len
         attn_flops = 0
         for window_size in self.window_sizes:
-            window = window_size[0]
-            effective_seq = t if window < 0 else min(window, t)
+            effective_seq = t if window_size < 0 else min(window_size, t)
             attn_flops += 12 * h * q * effective_seq
         return 6 * (nparams - nparams_exclude) + attn_flops
 
@@ -333,7 +342,8 @@ class GPT(nn.Module):
         for i, block in enumerate(self.blocks):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            ws = self.window_sizes[i]
+            x = block(x, ve, cos_sin, ws, self._masks[ws])
         x = norm(x)
 
         softcap = 15
@@ -344,7 +354,13 @@ class GPT(nn.Module):
 
         if targets is not None:
             # Cross-entropy in float32 (Critical note #4)
-            loss = mx.mean(nn.losses.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction='none')) if reduction == 'mean' else nn.losses.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction='none')
+            flat_logits = logits.reshape(-1, logits.shape[-1])
+            flat_targets = targets.reshape(-1)
+            ce = nn.losses.cross_entropy(flat_logits, flat_targets, reduction='none')
+            if reduction == 'mean':
+                loss = mx.mean(ce)
+            else:
+                loss = ce
             return loss
         return logits
 
@@ -412,7 +428,9 @@ def muon_step(stacked_grads, stacked_params, momentum_buffer, second_momentum_bu
     final_scale = step_size * (v_norm / mx.clip(v_norm_new, a_min=1e-10, a_max=None))
     g = g * final_scale.astype(g.dtype)
 
-    # Cautious weight decay + parameter update
+    # Cautious weight decay: only decay params where gradient agrees with param sign.
+    # This prevents decay from fighting the gradient direction. Follows the Muon
+    # reference implementation where the mask gates decay rather than the update.
     mask = (g * stacked_params) >= 0
     stacked_params = stacked_params - lr * g - lr * wd * stacked_params * mask
 
@@ -585,6 +603,7 @@ def detect_memory_tier():
     try:
         total_ram_gb = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024**3)
     except (AttributeError, ValueError):
+        print(f"Warning: could not detect system RAM, defaulting to Compact tier (8GB)")
         total_ram_gb = 8.0  # fallback to Compact
 
     if total_ram_gb < 12:
@@ -597,12 +616,51 @@ def detect_memory_tier():
         return "ultra", total_ram_gb, 32
 
 
+def detect_peak_flops():
+    """Estimate Apple Silicon bf16 peak TFLOPS from chip name.
+
+    Approximate values — actual throughput varies by workload and thermal state.
+    Falls back to 2 TFLOPS (M1 base) if detection fails.
+    """
+    # Mapping: substring in brand string -> approximate bf16 peak FLOPS
+    chip_flops = {
+        "M4 Ultra": 20e12,
+        "M4 Max": 10e12,
+        "M4 Pro": 5e12,
+        "M4": 2.5e12,
+        "M3 Ultra": 16e12,
+        "M3 Max": 8e12,
+        "M3 Pro": 4e12,
+        "M3": 2e12,
+        "M2 Ultra": 16e12,
+        "M2 Max": 8e12,
+        "M2 Pro": 4e12,
+        "M2": 2e12,
+        "M1 Ultra": 16e12,
+        "M1 Max": 8e12,
+        "M1 Pro": 4e12,
+        "M1": 2e12,
+    }
+    try:
+        brand = subprocess.check_output(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            text=True, timeout=5
+        ).strip()
+        # Check longer names first (e.g. "M4 Max" before "M4")
+        for chip, flops in chip_flops.items():
+            if chip in brand:
+                print(f"Detected {chip} — using {flops/1e12:.1f} TFLOPS for MFU estimate")
+                return flops
+    except Exception:
+        pass
+    # Fallback: conservative M1-base estimate
+    print("Warning: could not detect chip type, using 2.0 TFLOPS for MFU estimate")
+    return 2e12
+
+
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
-
-# Memory tier auto-detection
-MEMORY_TIER, TOTAL_RAM_GB, AUTO_BATCH_SIZE = detect_memory_tier()
 
 # Model architecture
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
@@ -623,7 +681,6 @@ FINAL_LR_FRAC = 0.0
 
 # Model size
 DEPTH = 4
-DEVICE_BATCH_SIZE = AUTO_BATCH_SIZE  # auto-detected from memory tier (override by editing directly)
 
 if __name__ == "__main__":
 
@@ -633,6 +690,10 @@ if __name__ == "__main__":
 
     t_start = time.perf_counter()
     mx.random.seed(42)
+
+    # Memory tier auto-detection
+    MEMORY_TIER, TOTAL_RAM_GB, AUTO_BATCH_SIZE = detect_memory_tier()
+    DEVICE_BATCH_SIZE = AUTO_BATCH_SIZE  # override by editing directly
 
     # Display memory tier
     usable_gb = max(0, TOTAL_RAM_GB - 3)  # ~3GB for macOS
@@ -694,9 +755,7 @@ if __name__ == "__main__":
     print(f"Time budget: {TIME_BUDGET}s")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
 
-    # Approximate peak FLOPs for Apple Silicon (M1/M2/M3 class)
-    # Conservative estimate: ~2 TFLOPS bf16 for base chips
-    APPLE_SILICON_BF16_PEAK_FLOPS = 2e12
+    APPLE_SILICON_BF16_PEAK_FLOPS = detect_peak_flops()
 
     # Schedules (all based on progress = training_time / TIME_BUDGET)
 
@@ -750,7 +809,7 @@ if __name__ == "__main__":
             total_loss = total_loss + loss
             last_micro_loss = loss * grad_accum_steps
             # CRITICAL: mx.eval() inside the loop bounds peak memory to ONE micro-step
-            mx.eval(total_loss, accumulated_grads)
+            mx.eval(total_loss, accumulated_grads, last_micro_loss)
             x, y, epoch = next(train_loader)  # prefetch next batch
 
         # Progress and schedules
@@ -773,7 +832,7 @@ if __name__ == "__main__":
         # Fast fail: abort if loss is exploding
         if math.isnan(train_loss_f) or train_loss_f > 100:
             print("FAIL")
-            exit(1)
+            sys.exit(1)
 
         t1 = time.perf_counter()
         dt = t1 - t0
