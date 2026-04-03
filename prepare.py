@@ -140,6 +140,10 @@ def download_data(num_shards: int, download_workers: int = 8) -> None:
         results = pool.map(download_single_shard, ids)
 
     ok = sum(1 for r in results if r)
+    failed_ids = [i for i, r in zip(ids, results) if not r]
+    if failed_ids:
+        failed_names = [f"shard_{i:05d}.parquet" for i in failed_ids]
+        print(f"Data: failed to download {len(failed_ids)} shards: {', '.join(failed_names)}")
     print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
 
 # ---------------------------------------------------------------------------

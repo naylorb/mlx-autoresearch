@@ -607,13 +607,18 @@ def detect_memory_tier() -> tuple[str, float, int]:
         total_ram_gb = 8.0  # fallback to Compact
 
     if total_ram_gb < 12:
-        return "compact", total_ram_gb, 2
+        tier, batch = "compact", 2
+        print(f"Memory: {total_ram_gb:.1f}GB < 12GB threshold → {tier} tier")
     elif total_ram_gb < 28:
-        return "standard", total_ram_gb, 8
+        tier, batch = "standard", 8
+        print(f"Memory: {total_ram_gb:.1f}GB < 28GB threshold → {tier} tier")
     elif total_ram_gb < 80:
-        return "pro", total_ram_gb, 16
+        tier, batch = "pro", 16
+        print(f"Memory: {total_ram_gb:.1f}GB < 80GB threshold → {tier} tier")
     else:
-        return "ultra", total_ram_gb, 32
+        tier, batch = "ultra", 32
+        print(f"Memory: {total_ram_gb:.1f}GB >= 80GB threshold → {tier} tier")
+    return tier, total_ram_gb, batch
 
 
 def detect_peak_flops() -> float:
@@ -690,6 +695,17 @@ if __name__ == "__main__":
 
     t_start = time.perf_counter()
     mx.random.seed(42)
+
+    # Validate data exists before proceeding
+    from prepare import TOKENIZER_DIR, DATA_DIR, LEGACY_TOKENIZER_DIRS, LEGACY_DATA_DIRS, _resolve_existing_dir
+    tok_dir = _resolve_existing_dir(TOKENIZER_DIR, LEGACY_TOKENIZER_DIRS, ["tokenizer.pkl"])
+    data_dir = _resolve_existing_dir(DATA_DIR, LEGACY_DATA_DIRS, [])
+    if not os.path.exists(os.path.join(tok_dir, "tokenizer.pkl")):
+        print("Error: Tokenizer not found. Run 'uv run prepare.py' first.")
+        sys.exit(1)
+    if not os.path.isdir(data_dir) or not any(f.endswith(".parquet") for f in os.listdir(data_dir)):
+        print("Error: Data not found. Run 'uv run prepare.py' first.")
+        sys.exit(1)
 
     # Memory tier auto-detection
     MEMORY_TIER, TOTAL_RAM_GB, AUTO_BATCH_SIZE = detect_memory_tier()
