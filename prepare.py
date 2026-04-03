@@ -18,6 +18,7 @@ import math
 import argparse
 import hashlib
 import pickle
+from collections.abc import Generator
 from multiprocessing import Pool
 
 import requests
@@ -339,7 +340,7 @@ def _document_batches(split, tokenizer_batch_size=128):
         epoch += 1
 
 
-def make_dataloader(tokenizer: Tokenizer, B: int, T: int, split: str, buffer_size: int = 1000):
+def make_dataloader(tokenizer: Tokenizer, B: int, T: int, split: str, buffer_size: int = 1000) -> Generator:
     """
     Best-fit packing dataloader with BOS-prefixed documents.
     Fresh documents begin with BOS. Cropped continuations are re-queued without

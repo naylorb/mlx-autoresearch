@@ -30,6 +30,7 @@ git clone https://github.com/naylorb/mlx-autoresearch.git
 cd mlx-autoresearch
 uv sync                                              # ~30 seconds (no 2GB torch)
 uv run prepare.py --num-shards 2                     # minimum viable: 1 train + 1 val shard
+uv run train.py --dry-run                            # verify setup (no training)
 uv run train.py                                      # runs on any Apple Silicon Mac
 ```
 
@@ -106,7 +107,8 @@ Install dev dependencies and run tests:
 uv sync --extra dev
 uv run pytest tests/ -v              # full suite (metal tests auto-skip on non-Apple)
 uv run pytest tests/ -m "not metal"  # source-level tests only (no MLX needed)
-uv run python smoke_test.py          # legacy test runner (no dependencies)
+python smoke_test.py                 # legacy test runner (no deps, no install needed)
+python smoke_test.py --metal         # legacy tests + runtime GPU tests
 ```
 
 To verify configuration without training:

@@ -21,5 +21,8 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev
 
-      - name: Run tests
+      - name: Run pytest
         run: uv run pytest tests/ -v
+
+      - name: Run legacy smoke tests
+        run: uv run python smoke_test.py --metal
