@@ -415,7 +415,7 @@ def make_dataloader(tokenizer: Tokenizer, B: int, T: int, split: str, buffer_siz
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-def evaluate_bpb(model: "mx.nn.Module", tokenizer: Tokenizer, batch_size: int) -> float:
+def evaluate_bpb(model: "mlx.nn.Module", tokenizer: Tokenizer, batch_size: int) -> float:
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
