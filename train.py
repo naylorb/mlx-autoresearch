@@ -331,7 +331,7 @@ class GPT(nn.Module):
             for i, v in enumerate(obj):
                 yield from self._flatten_params(v, f"{prefix}{i}.")
 
-    def __call__(self, idx, targets=None, reduction='mean'):
+    def __call__(self, idx: "mx.array", targets: "mx.array | None" = None, reduction: str = 'mean') -> "mx.array":
         B, T = idx.shape
         assert T <= self.cos.shape[1]
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -449,7 +449,7 @@ class MuonAdamW:
     Following MLX optimizer conventions.
     """
 
-    def __init__(self, model, param_groups):
+    def __init__(self, model: GPT, param_groups: dict[str, dict]) -> None:
         """
         param_groups: dict mapping param_path -> {kind, lr, ...}
         """
@@ -507,7 +507,7 @@ class MuonAdamW:
         else:
             setattr(obj, last, value)
 
-    def update(self, model, grads):
+    def update(self, model: GPT, grads: dict) -> None:
         """Update model parameters given gradients. Modifies model in place."""
         self.step_count += 1
 
@@ -598,7 +598,7 @@ class MuonAdamW:
 # Memory Tier System
 # ---------------------------------------------------------------------------
 
-def detect_memory_tier():
+def detect_memory_tier() -> tuple[str, float, int]:
     """Auto-detect system RAM and return (tier_name, total_ram_gb, device_batch_size)."""
     try:
         total_ram_gb = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024**3)
@@ -616,7 +616,7 @@ def detect_memory_tier():
         return "ultra", total_ram_gb, 32
 
 
-def detect_peak_flops():
+def detect_peak_flops() -> float:
     """Estimate Apple Silicon bf16 peak TFLOPS from chip name.
 
     Approximate values — actual throughput varies by workload and thermal state.
