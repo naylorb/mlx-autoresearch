@@ -385,6 +385,32 @@ class TestBatchSizeValidation:
         assert "must be divisible by" in src
 
 
+class TestOptimizerPathErrors:
+    """Optimizer param navigation has contextual error messages."""
+
+    def test_get_param_error_context(self):
+        src = read(TRAIN)
+        assert "Parameter path" in src and "not found in model" in src
+
+    def test_set_param_error_context(self):
+        src = read(TRAIN)
+        # Both _get_param and _set_param should have error handling
+        func_bodies = re.findall(r"def _(?:get|set)_param\(.*?\n(?:.*?\n)*?.*?from e", src)
+        assert len(func_bodies) == 2, "both _get_param and _set_param should have error handling"
+
+
+class TestWindowPatternValidation:
+    """Window pattern validates non-empty and valid chars."""
+
+    def test_empty_pattern_assertion(self):
+        src = read(TRAIN)
+        assert "must not be empty" in src
+
+    def test_invalid_chars_assertion(self):
+        src = read(TRAIN)
+        assert "must contain only S/L" in src
+
+
 class TestDownloadFailureReporting:
     """prepare.py reports specific failed shards."""
 

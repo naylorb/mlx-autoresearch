@@ -211,7 +211,8 @@ class GPT(nn.Module):
 
     def _compute_window_sizes(self, config):
         pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
+        assert len(pattern) > 0, "window_pattern must not be empty"
+        assert all(c in "SL" for c in pattern), f"window_pattern must contain only S/L, got '{pattern}'"
         long_window = config.sequence_len
         short_window = long_window // 2
         char_to_window = {"L": long_window, "S": short_window}
@@ -479,33 +480,45 @@ class MuonAdamW:
     def _get_param(self, model, path):
         """Navigate model tree to get parameter at path."""
         obj = model
-        for part in path.split("."):
-            if isinstance(obj, dict):
-                obj = obj[part]
-            elif isinstance(obj, (list, tuple)):
-                obj = obj[int(part)]
-            else:
-                obj = getattr(obj, part)
+        try:
+            for part in path.split("."):
+                if isinstance(obj, dict):
+                    obj = obj[part]
+                elif isinstance(obj, (list, tuple)):
+                    obj = obj[int(part)]
+                else:
+                    obj = getattr(obj, part)
+        except (KeyError, IndexError, AttributeError, ValueError) as e:
+            raise RuntimeError(
+                f"Parameter path '{path}' not found in model: {e}\n"
+                "Check that optimizer groups match the model structure."
+            ) from e
         return obj
 
     def _set_param(self, model, path, value):
         """Navigate model tree to set parameter at path."""
         parts = path.split(".")
         obj = model
-        for part in parts[:-1]:
+        try:
+            for part in parts[:-1]:
+                if isinstance(obj, dict):
+                    obj = obj[part]
+                elif isinstance(obj, (list, tuple)):
+                    obj = obj[int(part)]
+                else:
+                    obj = getattr(obj, part)
+            last = parts[-1]
             if isinstance(obj, dict):
-                obj = obj[part]
+                obj[last] = value
             elif isinstance(obj, (list, tuple)):
-                obj = obj[int(part)]
+                obj[int(last)] = value
             else:
-                obj = getattr(obj, part)
-        last = parts[-1]
-        if isinstance(obj, dict):
-            obj[last] = value
-        elif isinstance(obj, (list, tuple)):
-            obj[int(last)] = value
-        else:
-            setattr(obj, last, value)
+                setattr(obj, last, value)
+        except (KeyError, IndexError, AttributeError, ValueError) as e:
+            raise RuntimeError(
+                f"Parameter path '{path}' not found in model: {e}\n"
+                "Check that optimizer groups match the model structure."
+            ) from e
 
     def update(self, model: GPT, grads: dict) -> None:
         """Update model parameters given gradients. Modifies model in place."""
