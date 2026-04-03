@@ -27,7 +27,7 @@ This repository is nominally about ML pretraining, but the underlying autoresear
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh   # install uv (~5 seconds)
 git clone https://github.com/naylorb/mlx-autoresearch.git
-cd autoresearch-mlx-dlx
+cd mlx-autoresearch
 uv sync                                              # ~30 seconds (no 2GB torch)
 uv run prepare.py --num-shards 2                     # minimum viable: 1 train + 1 val shard
 uv run train.py                                      # runs on any Apple Silicon Mac
@@ -97,6 +97,34 @@ See `program.md` for the full agent protocol. The short version:
 - **Cache isolation**: this fork writes to `~/.cache/autoresearch-mlx-dlx/` by default so it does not trample tokenizer or shard state from other autoresearch forks. Set `AUTORESEARCH_MLX_DLX_CACHE_DIR` to override, and legacy `~/.cache/autoresearch-mlx/` and `~/.cache/autoresearch/` artifacts are still readable.
 
 - **`mx.eval()` per micro-step**: MLX uses lazy evaluation. Without explicit eval boundaries inside the gradient accumulation loop, the framework builds the entire computation graph before executing. For 16 micro-steps on an 8GB machine, that's instant OOM. The eval calls are load-bearing.
+
+## Development
+
+Install dev dependencies and run tests:
+
+```bash
+uv sync --extra dev
+uv run pytest tests/ -v              # full suite (metal tests auto-skip on non-Apple)
+uv run pytest tests/ -m "not metal"  # source-level tests only (no MLX needed)
+uv run python smoke_test.py          # legacy test runner (no dependencies)
+```
+
+To verify configuration without training:
+
+```bash
+uv run train.py --dry-run
+```
+
+## Troubleshooting
+
+**"MLX not found" / `ImportError: libmlx.so`**
+MLX only runs on Apple Silicon Macs. This project cannot run on Intel Macs, Linux, or Windows. Check with `python -c "import mlx.core"`.
+
+**"Data not found" / "Tokenizer not found"**
+Run `uv run prepare.py` first to download data shards and train the tokenizer. For a minimal setup: `uv run prepare.py --num-shards 2`.
+
+**OOM on compact tier (8GB)**
+The compact tier is tight on memory. If you hit OOM, make sure no other memory-heavy apps are running (browsers, IDEs). If it persists, try reducing `DEPTH` in `train.py` (e.g., from 4 to 3). Do not reduce `TOTAL_BATCH_SIZE` — that changes the effective learning rate.
 
 ## Security
 
