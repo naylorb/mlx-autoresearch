@@ -1,5 +1,7 @@
 # autoresearch-mlx-dlx
 
+[![CI](https://github.com/naylorb/mlx-autoresearch/actions/workflows/ci.yml/badge.svg)](https://github.com/naylorb/mlx-autoresearch/actions/workflows/ci.yml)
+
 Native Apple Silicon autonomous research — from 8GB MacBook to 192GB Mac Studio.
 
 ## Why this fork?
