@@ -699,11 +699,13 @@ if __name__ == "__main__":
     # Validate data exists before proceeding
     from prepare import TOKENIZER_DIR, DATA_DIR, LEGACY_TOKENIZER_DIRS, LEGACY_DATA_DIRS, _resolve_existing_dir
     tok_dir = _resolve_existing_dir(TOKENIZER_DIR, LEGACY_TOKENIZER_DIRS, ["tokenizer.pkl"])
-    data_dir = _resolve_existing_dir(DATA_DIR, LEGACY_DATA_DIRS, [])
     if not os.path.exists(os.path.join(tok_dir, "tokenizer.pkl")):
         print("Error: Tokenizer not found. Run 'uv run prepare.py' first.")
         sys.exit(1)
-    if not os.path.isdir(data_dir) or not any(f.endswith(".parquet") for f in os.listdir(data_dir)):
+    # Check preferred and legacy data dirs for parquet files
+    def _has_parquets(d):
+        return os.path.isdir(d) and any(f.endswith(".parquet") for f in os.listdir(d))
+    if not any(_has_parquets(d) for d in [DATA_DIR] + LEGACY_DATA_DIRS):
         print("Error: Data not found. Run 'uv run prepare.py' first.")
         sys.exit(1)
 

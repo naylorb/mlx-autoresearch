@@ -297,6 +297,91 @@ class TestGPTConfigConsistency:
         assert n_head % n_kv_head == 0
 
 
+class TestSafeEvalConst:
+    """safe_eval_const rejects unsafe expressions."""
+
+    def test_power_expression(self):
+        assert safe_eval_const("2**16") == 65536
+
+    def test_float_literal(self):
+        assert safe_eval_const("0.04") == 0.04
+
+    def test_negative(self):
+        assert safe_eval_const("-1") == -1
+
+    def test_arithmetic(self):
+        assert safe_eval_const("2 * 3 + 1") == 7
+
+    def test_rejects_function_call(self):
+        with pytest.raises(ValueError, match="unsafe"):
+            safe_eval_const("__import__('os')")
+
+    def test_rejects_attribute_access(self):
+        with pytest.raises(ValueError, match="unsafe"):
+            safe_eval_const("os.system('echo hi')")
+
+    def test_rejects_string(self):
+        with pytest.raises(ValueError, match="unsafe"):
+            safe_eval_const("'hello'")
+
+
+class TestDryRunFlag:
+    """--dry-run flag source-level checks."""
+
+    def test_dry_run_in_source(self):
+        src = read(TRAIN)
+        assert '"--dry-run"' in src
+
+    def test_dry_run_exits_cleanly(self):
+        src = read(TRAIN)
+        # Should call sys.exit(0), not sys.exit(1)
+        # Find the dry-run block and verify it exits with 0
+        dry_run_section = src[src.index('"--dry-run"'):]
+        exit_match = re.search(r"sys\.exit\((\d+)\)", dry_run_section)
+        assert exit_match and exit_match.group(1) == "0"
+
+
+class TestStartupValidation:
+    """Startup validation source-level checks."""
+
+    def test_tokenizer_check_before_model(self):
+        src = read(TRAIN)
+        tok_check = src.index("Tokenizer not found")
+        model_build = src.index("model = GPT(config)")
+        assert tok_check < model_build, "tokenizer check must come before model build"
+
+    def test_data_check_before_model(self):
+        src = read(TRAIN)
+        data_check = src.index("Data not found")
+        model_build = src.index("model = GPT(config)")
+        assert data_check < model_build, "data check must come before model build"
+
+    def test_clear_error_messages(self):
+        src = read(TRAIN)
+        assert "uv run prepare.py" in src, "error messages should tell user how to fix"
+
+
+class TestDetectMemoryTierLogging:
+    """detect_memory_tier logs threshold info."""
+
+    def test_threshold_logged(self):
+        src = read(TRAIN)
+        # Find the detect_memory_tier function body
+        func_start = src.index("def detect_memory_tier")
+        func_end = src.index("\ndef ", func_start + 1)
+        func_body = src[func_start:func_end]
+        assert "threshold" in func_body, "detect_memory_tier should log threshold info"
+
+
+class TestDownloadFailureReporting:
+    """prepare.py reports specific failed shards."""
+
+    def test_failed_shard_names_printed(self):
+        src = read(PREPARE)
+        assert "failed_ids" in src
+        assert "failed_names" in src
+
+
 # ---------------------------------------------------------------------------
 # Runtime tests (require MLX)
 # ---------------------------------------------------------------------------
