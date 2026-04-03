@@ -373,6 +373,18 @@ class TestDetectMemoryTierLogging:
         assert "threshold" in func_body, "detect_memory_tier should log threshold info"
 
 
+class TestBatchSizeValidation:
+    """Startup validates DEVICE_BATCH_SIZE and alignment."""
+
+    def test_batch_size_validation_in_source(self):
+        src = read(TRAIN)
+        assert "DEVICE_BATCH_SIZE must be positive" in src
+
+    def test_alignment_error_message(self):
+        src = read(TRAIN)
+        assert "must be divisible by" in src
+
+
 class TestDownloadFailureReporting:
     """prepare.py reports specific failed shards."""
 

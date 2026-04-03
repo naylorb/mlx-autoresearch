@@ -748,8 +748,14 @@ if __name__ == "__main__":
     num_flops_per_token = model.estimate_flops()
     print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
+    if DEVICE_BATCH_SIZE <= 0:
+        print(f"Error: DEVICE_BATCH_SIZE must be positive, got {DEVICE_BATCH_SIZE}")
+        sys.exit(1)
     tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-    assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+    if TOTAL_BATCH_SIZE % tokens_per_fwdbwd != 0:
+        print(f"Error: TOTAL_BATCH_SIZE ({TOTAL_BATCH_SIZE}) must be divisible by "
+              f"DEVICE_BATCH_SIZE * MAX_SEQ_LEN ({DEVICE_BATCH_SIZE} * {MAX_SEQ_LEN} = {tokens_per_fwdbwd})")
+        sys.exit(1)
     grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
     if "--dry-run" in sys.argv:
