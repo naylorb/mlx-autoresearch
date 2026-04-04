@@ -17,5 +17,14 @@ dependencies = [
     "tiktoken==0.11.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "metal: requires Apple Silicon with MLX/Metal (deselect with '-m not metal')",
+]
+
 [project.urls]
 Repository = "https://github.com/naylorb/mlx-autoresearch"

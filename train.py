@@ -211,7 +211,8 @@ class GPT(nn.Module):
 
     def _compute_window_sizes(self, config):
         pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
+        assert len(pattern) > 0, "window_pattern must not be empty"
+        assert all(c in "SL" for c in pattern), f"window_pattern must contain only S/L, got '{pattern}'"
         long_window = config.sequence_len
         short_window = long_window // 2
         char_to_window = {"L": long_window, "S": short_window}
@@ -331,7 +332,7 @@ class GPT(nn.Module):
             for i, v in enumerate(obj):
                 yield from self._flatten_params(v, f"{prefix}{i}.")
 
-    def __call__(self, idx, targets=None, reduction='mean'):
+    def __call__(self, idx: "mx.array", targets: "mx.array | None" = None, reduction: str = 'mean') -> "mx.array":
         B, T = idx.shape
         assert T <= self.cos.shape[1]
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -449,7 +450,7 @@ class MuonAdamW:
     Following MLX optimizer conventions.
     """
 
-    def __init__(self, model, param_groups):
+    def __init__(self, model: GPT, param_groups: dict[str, dict]) -> None:
         """
         param_groups: dict mapping param_path -> {kind, lr, ...}
         """
@@ -479,35 +480,47 @@ class MuonAdamW:
     def _get_param(self, model, path):
         """Navigate model tree to get parameter at path."""
         obj = model
-        for part in path.split("."):
-            if isinstance(obj, dict):
-                obj = obj[part]
-            elif isinstance(obj, (list, tuple)):
-                obj = obj[int(part)]
-            else:
-                obj = getattr(obj, part)
+        try:
+            for part in path.split("."):
+                if isinstance(obj, dict):
+                    obj = obj[part]
+                elif isinstance(obj, (list, tuple)):
+                    obj = obj[int(part)]
+                else:
+                    obj = getattr(obj, part)
+        except (KeyError, IndexError, AttributeError, ValueError) as e:
+            raise RuntimeError(
+                f"Parameter path '{path}' not found in model: {e}\n"
+                "Check that optimizer groups match the model structure."
+            ) from e
         return obj
 
     def _set_param(self, model, path, value):
         """Navigate model tree to set parameter at path."""
         parts = path.split(".")
         obj = model
-        for part in parts[:-1]:
+        try:
+            for part in parts[:-1]:
+                if isinstance(obj, dict):
+                    obj = obj[part]
+                elif isinstance(obj, (list, tuple)):
+                    obj = obj[int(part)]
+                else:
+                    obj = getattr(obj, part)
+            last = parts[-1]
             if isinstance(obj, dict):
-                obj = obj[part]
+                obj[last] = value
             elif isinstance(obj, (list, tuple)):
-                obj = obj[int(part)]
+                obj[int(last)] = value
             else:
-                obj = getattr(obj, part)
-        last = parts[-1]
-        if isinstance(obj, dict):
-            obj[last] = value
-        elif isinstance(obj, (list, tuple)):
-            obj[int(last)] = value
-        else:
-            setattr(obj, last, value)
+                setattr(obj, last, value)
+        except (KeyError, IndexError, AttributeError, ValueError) as e:
+            raise RuntimeError(
+                f"Parameter path '{path}' not found in model: {e}\n"
+                "Check that optimizer groups match the model structure."
+            ) from e
 
-    def update(self, model, grads):
+    def update(self, model: GPT, grads: dict) -> None:
         """Update model parameters given gradients. Modifies model in place."""
         self.step_count += 1
 
@@ -598,7 +611,7 @@ class MuonAdamW:
 # Memory Tier System
 # ---------------------------------------------------------------------------
 
-def detect_memory_tier():
+def detect_memory_tier() -> tuple[str, float, int]:
     """Auto-detect system RAM and return (tier_name, total_ram_gb, device_batch_size)."""
     try:
         total_ram_gb = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024**3)
@@ -607,16 +620,21 @@ def detect_memory_tier():
         total_ram_gb = 8.0  # fallback to Compact
 
     if total_ram_gb < 12:
-        return "compact", total_ram_gb, 2
+        tier, batch = "compact", 2
+        print(f"Memory: {total_ram_gb:.1f}GB < 12GB threshold → {tier} tier")
     elif total_ram_gb < 28:
-        return "standard", total_ram_gb, 8
+        tier, batch = "standard", 8
+        print(f"Memory: {total_ram_gb:.1f}GB < 28GB threshold → {tier} tier")
     elif total_ram_gb < 80:
-        return "pro", total_ram_gb, 16
+        tier, batch = "pro", 16
+        print(f"Memory: {total_ram_gb:.1f}GB < 80GB threshold → {tier} tier")
     else:
-        return "ultra", total_ram_gb, 32
+        tier, batch = "ultra", 32
+        print(f"Memory: {total_ram_gb:.1f}GB >= 80GB threshold → {tier} tier")
+    return tier, total_ram_gb, batch
 
 
-def detect_peak_flops():
+def detect_peak_flops() -> float:
     """Estimate Apple Silicon bf16 peak TFLOPS from chip name.
 
     Approximate values — actual throughput varies by workload and thermal state.
@@ -691,6 +709,19 @@ if __name__ == "__main__":
     t_start = time.perf_counter()
     mx.random.seed(42)
 
+    # Validate data exists before proceeding
+    from prepare import TOKENIZER_DIR, DATA_DIR, LEGACY_TOKENIZER_DIRS, LEGACY_DATA_DIRS, _resolve_existing_dir
+    tok_dir = _resolve_existing_dir(TOKENIZER_DIR, LEGACY_TOKENIZER_DIRS, ["tokenizer.pkl"])
+    if not os.path.exists(os.path.join(tok_dir, "tokenizer.pkl")):
+        print("Error: Tokenizer not found. Run 'uv run prepare.py' first.")
+        sys.exit(1)
+    # Check preferred and legacy data dirs for parquet files
+    def _has_parquets(d):
+        return os.path.isdir(d) and any(f.endswith(".parquet") for f in os.listdir(d))
+    if not any(_has_parquets(d) for d in [DATA_DIR] + LEGACY_DATA_DIRS):
+        print("Error: Data not found. Run 'uv run prepare.py' first.")
+        sys.exit(1)
+
     # Memory tier auto-detection
     MEMORY_TIER, TOTAL_RAM_GB, AUTO_BATCH_SIZE = detect_memory_tier()
     DEVICE_BATCH_SIZE = AUTO_BATCH_SIZE  # override by editing directly
@@ -730,9 +761,27 @@ if __name__ == "__main__":
     num_flops_per_token = model.estimate_flops()
     print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
+    if DEVICE_BATCH_SIZE <= 0:
+        print(f"Error: DEVICE_BATCH_SIZE must be positive, got {DEVICE_BATCH_SIZE}")
+        sys.exit(1)
     tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-    assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+    if TOTAL_BATCH_SIZE % tokens_per_fwdbwd != 0:
+        print(f"Error: TOTAL_BATCH_SIZE ({TOTAL_BATCH_SIZE}) must be divisible by "
+              f"DEVICE_BATCH_SIZE * MAX_SEQ_LEN ({DEVICE_BATCH_SIZE} * {MAX_SEQ_LEN} = {tokens_per_fwdbwd})")
+        sys.exit(1)
     grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+
+    if "--dry-run" in sys.argv:
+        print()
+        print("--- dry run summary ---")
+        print(f"Memory tier:              {MEMORY_TIER}")
+        print(f"Device batch size:        {DEVICE_BATCH_SIZE}")
+        print(f"Gradient accumulation:    {grad_accum_steps}")
+        print(f"Total batch size:         {TOTAL_BATCH_SIZE:,} tokens")
+        print(f"Total parameters:         {num_params:,}")
+        print(f"Trainable parameters:     {model.count_params():,}")
+        print(f"FLOPs per token:          {num_flops_per_token:e}")
+        sys.exit(0)
 
     # Build optimizer
     param_group_config = model.setup_optimizer_groups(

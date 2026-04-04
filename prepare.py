@@ -18,6 +18,7 @@ import math
 import argparse
 import hashlib
 import pickle
+from collections.abc import Generator
 from multiprocessing import Pool
 
 import requests
@@ -119,7 +120,7 @@ def download_single_shard(index):
     return False
 
 
-def download_data(num_shards, download_workers=8):
+def download_data(num_shards: int, download_workers: int = 8) -> None:
     """Download training shards + pinned validation shard."""
     os.makedirs(DATA_DIR, exist_ok=True)
     num_train = min(num_shards, MAX_SHARD)
@@ -140,6 +141,10 @@ def download_data(num_shards, download_workers=8):
         results = pool.map(download_single_shard, ids)
 
     ok = sum(1 for r in results if r)
+    failed_ids = [i for i, r in zip(ids, results) if not r]
+    if failed_ids:
+        failed_names = [f"shard_{i:05d}.parquet" for i in failed_ids]
+        print(f"Data: failed to download {len(failed_ids)} shards: {', '.join(failed_names)}")
     print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
 
 # ---------------------------------------------------------------------------
@@ -243,12 +248,12 @@ def train_tokenizer():
 class Tokenizer:
     """Minimal tokenizer wrapper. Training is handled above."""
 
-    def __init__(self, enc):
+    def __init__(self, enc: "tiktoken.Encoding") -> None:
         self.enc = enc
         self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
 
     @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
+    def from_directory(cls, tokenizer_dir: str = TOKENIZER_DIR) -> "Tokenizer":
         tokenizer_dir = _resolve_existing_dir(
             tokenizer_dir,
             LEGACY_TOKENIZER_DIRS,
@@ -276,13 +281,13 @@ class Tokenizer:
             enc = pickle.load(f)
         return cls(enc)
 
-    def get_vocab_size(self):
+    def get_vocab_size(self) -> int:
         return self.enc.n_vocab
 
-    def get_bos_token_id(self):
+    def get_bos_token_id(self) -> int:
         return self.bos_token_id
 
-    def encode(self, text, prepend=None, num_threads=8):
+    def encode(self, text: str | list[str], prepend: int | str | None = None, num_threads: int = 8) -> list[int] | list[list[int]]:
         if prepend is not None:
             prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
         if isinstance(text, str):
@@ -298,7 +303,7 @@ class Tokenizer:
             raise ValueError(f"Invalid input type: {type(text)}")
         return ids
 
-    def decode(self, ids):
+    def decode(self, ids: list[int]) -> str:
         return self.enc.decode(ids)
 
 
@@ -335,7 +340,7 @@ def _document_batches(split, tokenizer_batch_size=128):
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def make_dataloader(tokenizer: Tokenizer, B: int, T: int, split: str, buffer_size: int = 1000) -> Generator:
     """
     Best-fit packing dataloader with BOS-prefixed documents.
     Fresh documents begin with BOS. Cropped continuations are re-queued without
@@ -410,7 +415,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 # Evaluation (DO NOT CHANGE — this is the fixed metric)
 # ---------------------------------------------------------------------------
 
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_bpb(model: "mlx.nn.Module", tokenizer: Tokenizer, batch_size: int) -> float:
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
